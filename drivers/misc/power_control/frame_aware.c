@@ -30,7 +30,6 @@
 #include <linux/vmalloc.h>
 #include <linux/pid.h>
 #include <linux/sched/task.h>
-#include <linux/wakelock.h>
 #include <linux/suspend.h>
 
 #define APP_CATEGORY_SYSTEM 0
@@ -159,8 +158,6 @@ static DEFINE_SPINLOCK(app_profiles_lock);
 static DEFINE_SPINLOCK(pid_detect_lock);
 static bool pid_detect_in_progress = false;
 static unsigned long pid_detect_start_jiffies = 0;
-
-static struct wakeup_source *fa_wakelock;
 
 static const char *foreground_process_patterns[] = {
     "com.android.systemui",
@@ -1129,13 +1126,8 @@ static void force_freeze_all_tasks(void)
 
 static void schedule_screen_off_mode(void)
 {
-    struct task_struct *p;
-    
     if (screen_off_processed)
         return;
-    
-    if (fa_wakelock)
-        __pm_stay_awake(fa_wakelock);
     
     cancel_delayed_work_sync(&check_work);
     cancel_delayed_work_sync(&power_check_work);
@@ -1151,9 +1143,6 @@ static void schedule_screen_off_mode(void)
     set_all_little_core_freq(LOCK_FREQ_KHZ);
     
     force_freeze_all_tasks();
-    
-    if (fa_wakelock)
-        __pm_relax(fa_wakelock);
     
     screen_off_processed = true;
 }
@@ -1804,8 +1793,6 @@ static int __init fa_init(void)
     INIT_LIST_HEAD(&app_profiles);
     spin_lock_init(&pid_detect_lock);
     
-    fa_wakelock = wakeup_source_register(NULL, "frame_aware_screen_off");
-    
     fa_wq = alloc_workqueue("frame_aware_wq", WQ_FREEZABLE | WQ_MEM_RECLAIM | WQ_UNBOUND, 1);
     if (!fa_wq) {
         return -ENOMEM;
@@ -1853,9 +1840,6 @@ static void __exit fa_exit(void)
         flush_workqueue(fa_wq);
         destroy_workqueue(fa_wq);
     }
-    
-    if (fa_wakelock)
-        wakeup_source_unregister(fa_wakelock);
     
     spin_lock(&task_list_lock);
     list_for_each_entry_safe(info, tmp, &task_list, list) {
