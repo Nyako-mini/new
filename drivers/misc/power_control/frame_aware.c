@@ -527,7 +527,7 @@ static void unfreeze_all_tasks(void)
         if (p->pid <= 100)
             continue;
         if (frozen(p))
-            thaw_process(p);
+            __thaw_task(p);
         set_user_nice(p, 0);
         set_cpus_allowed_ptr(p, &all_mask);
     }
@@ -1166,7 +1166,7 @@ static void schedule_screen_on_mode(void)
         if (!p->mm || p->flags & PF_KTHREAD)
             continue;
         if (frozen(p))
-            thaw_process(p);
+            __thaw_task(p);
         info = find_task_info(p->pid);
         if (info) {
             info->is_frozen = false;
