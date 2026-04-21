@@ -30,6 +30,8 @@
 #include <linux/vmalloc.h>
 #include <linux/pid.h>
 #include <linux/sched/task.h>
+#include <linux/wakelock.h>
+#include <linux/suspend.h>
 
 #define APP_CATEGORY_SYSTEM 0
 #define APP_CATEGORY_BACKGROUND 1
@@ -157,6 +159,8 @@ static DEFINE_SPINLOCK(app_profiles_lock);
 static DEFINE_SPINLOCK(pid_detect_lock);
 static bool pid_detect_in_progress = false;
 static unsigned long pid_detect_start_jiffies = 0;
+
+static struct wakeup_source *fa_wakelock;
 
 static const char *foreground_process_patterns[] = {
     "com.android.systemui",
@@ -525,6 +529,8 @@ static void unfreeze_all_tasks(void)
             continue;
         if (p->pid <= 100)
             continue;
+        if (frozen(p))
+            thaw_process(p);
         set_user_nice(p, 0);
         set_cpus_allowed_ptr(p, &all_mask);
     }
@@ -1097,22 +1103,10 @@ static void update_task_info(struct task_struct *task)
     }
 }
 
-static void schedule_screen_off_mode(void)
+static void force_freeze_all_tasks(void)
 {
     struct task_struct *p;
     struct task_info *info;
-    
-    if (screen_off_processed)
-        return;
-    
-    offline_all_big_cores();
-    offline_all_little_cores();
-    online_two_little_cores();
-    
-    cancel_delayed_work(&check_work);
-    cancel_delayed_work(&power_check_work);
-    cancel_delayed_work(&idle_check_work);
-    cancel_delayed_work(&pid_detect_work);
     
     rcu_read_lock();
     for_each_process(p) {
@@ -1120,18 +1114,46 @@ static void schedule_screen_off_mode(void)
             continue;
         if (p->pid <= 100)
             continue;
-        info = find_task_info(p->pid);
-        if (info && info->is_whitelisted) {
+        
+        if (!freeze_task(p)) {
             set_user_nice(p, 19);
             set_cpus_allowed_ptr(p, &screen_off_mask);
-        } else {
-            set_user_nice(p, 19);
-            set_cpus_allowed_ptr(p, &screen_off_mask);
-            if (info)
-                info->is_frozen = true;
         }
+        
+        info = find_task_info(p->pid);
+        if (info)
+            info->is_frozen = true;
     }
     rcu_read_unlock();
+}
+
+static void schedule_screen_off_mode(void)
+{
+    struct task_struct *p;
+    
+    if (screen_off_processed)
+        return;
+    
+    if (fa_wakelock)
+        __pm_stay_awake(fa_wakelock);
+    
+    cancel_delayed_work_sync(&check_work);
+    cancel_delayed_work_sync(&power_check_work);
+    cancel_delayed_work_sync(&idle_check_work);
+    cancel_delayed_work_sync(&pid_detect_work);
+    cancel_delayed_work_sync(&thermal_check_work);
+    flush_workqueue(fa_wq);
+    
+    offline_all_big_cores();
+    offline_all_little_cores();
+    online_two_little_cores();
+    
+    set_all_little_core_freq(LOCK_FREQ_KHZ);
+    
+    force_freeze_all_tasks();
+    
+    if (fa_wakelock)
+        __pm_relax(fa_wakelock);
     
     screen_off_processed = true;
 }
@@ -1154,10 +1176,15 @@ static void schedule_screen_on_mode(void)
     for_each_process(p) {
         if (!p->mm || p->flags & PF_KTHREAD)
             continue;
+        if (frozen(p))
+            thaw_process(p);
         info = find_task_info(p->pid);
-        if (info && info->is_whitelisted) {
-            set_user_nice(p, 0);
-            set_cpus_allowed_ptr(p, &little_mask);
+        if (info) {
+            info->is_frozen = false;
+            if (info->is_whitelisted) {
+                set_user_nice(p, 0);
+                set_cpus_allowed_ptr(p, &little_mask);
+            }
         }
     }
     rcu_read_unlock();
@@ -1173,6 +1200,8 @@ static void schedule_screen_on_mode(void)
                           msecs_to_jiffies(IDLE_NO_TOUCH_DELAY_MS));
         queue_delayed_work(fa_wq, &pid_detect_work,
                           msecs_to_jiffies(PID_CHECK_INTERVAL_MS));
+        queue_delayed_work(fa_wq, &thermal_check_work,
+                          msecs_to_jiffies(5000));
     }
 }
 
@@ -1774,6 +1803,9 @@ static int __init fa_init(void)
     INIT_LIST_HEAD(&task_list);
     INIT_LIST_HEAD(&app_profiles);
     spin_lock_init(&pid_detect_lock);
+    
+    fa_wakelock = wakeup_source_register(NULL, "frame_aware_screen_off");
+    
     fa_wq = alloc_workqueue("frame_aware_wq", WQ_FREEZABLE | WQ_MEM_RECLAIM | WQ_UNBOUND, 1);
     if (!fa_wq) {
         return -ENOMEM;
@@ -1821,6 +1853,10 @@ static void __exit fa_exit(void)
         flush_workqueue(fa_wq);
         destroy_workqueue(fa_wq);
     }
+    
+    if (fa_wakelock)
+        wakeup_source_unregister(fa_wakelock);
+    
     spin_lock(&task_list_lock);
     list_for_each_entry_safe(info, tmp, &task_list, list) {
         list_del(&info->list);
