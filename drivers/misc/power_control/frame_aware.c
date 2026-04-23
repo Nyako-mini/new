@@ -31,10 +31,6 @@
 #include <linux/pid.h>
 #include <linux/sched/task.h>
 #include <linux/suspend.h>
-#include <linux/of.h>
-#include <linux/platform_device.h>
-#include <linux/regulator/consumer.h>
-#include <linux/iio/consumer.h>
 
 #define APP_CATEGORY_SYSTEM 0
 #define APP_CATEGORY_BACKGROUND 1
@@ -93,7 +89,6 @@
 
 #define CURRENT_PATH "/sys/class/power_supply/battery/current_now"
 #define VOLTAGE_PATH "/sys/class/power_supply/battery/voltage_now"
-#define POWER_PATH "/sys/class/power_supply/battery/power_now"
 
 static cpumask_t little_mask;
 static cpumask_t big_mask;
@@ -187,6 +182,265 @@ static const char *foreground_process_patterns[] = {
     "com.android.chrome",
     NULL
 };
+
+static void init_masks(void);
+static unsigned int get_cpu_load(int cpu);
+static unsigned int get_big_core_load(void);
+static unsigned int get_little_core_load(void);
+static void set_cpu_freq(const cpumask_t *mask, unsigned int khz);
+static void set_all_big_core_freq(unsigned int khz);
+static void set_all_little_core_freq(unsigned int khz);
+static void online_all_little_cores(void);
+static void offline_all_little_cores(void);
+static void offline_all_big_cores(void);
+static void online_two_little_cores(void);
+static int read_int_from_file(const char *path, int *value);
+static long get_battery_power_uw(void);
+static void update_power_statistics(void);
+static void emergency_power_throttle(void);
+static void warning_power_throttle(void);
+static void emergency_power_restore(void);
+static void warning_power_restore(void);
+static void emergency_thermal_throttle(void);
+static void warning_thermal_throttle(void);
+static void emergency_thermal_restore(void);
+static void warning_thermal_restore(void);
+static void load_config_from_file(void);
+static void free_cluster_apps(void);
+static void unfreeze_all_tasks(void);
+static struct task_info *find_task_info(pid_t pid);
+static void enter_screen_idle_mode(void);
+static void exit_screen_idle_mode(void);
+static int get_app_cluster_type(const char *package_name);
+static void schedule_app_by_cluster(struct task_struct *p, struct task_info *info, int cluster_type);
+static void schedule_normal_app(struct task_struct *p, struct task_info *info);
+static void adjust_frequencies_with_power(void);
+static void get_cpu_temperature(void);
+static void check_thermal_status(void);
+static void update_task_info(struct task_struct *task);
+static void schedule_screen_off_mode(void);
+static void schedule_screen_on_mode(void);
+static void idle_check_work_func(struct work_struct *work);
+static void check_work_func(struct work_struct *work);
+static void boost_work_func(struct work_struct *work);
+static void screen_off_work_func(struct work_struct *work);
+static void power_check_work_func(struct work_struct *work);
+static void thermal_check_work_func(struct work_struct *work);
+static void boot_complete_work_func(struct work_struct *work);
+static void pid_detect_work_func(struct work_struct *work);
+static int fb_notif_call(struct notifier_block *nb, unsigned long event, void *data);
+static int fa_input_connect(struct input_handler *handler, struct input_dev *dev, const struct input_device_id *id);
+static void fa_input_disconnect(struct input_handle *handle);
+static void fa_input_event(struct input_handle *handle, unsigned int type, unsigned int code, int value);
+static void detect_foreground_pid_safe(void);
+static int read_temperature_from_file(const char *path);
+static bool get_package_name_safe(pid_t pid, char *buf, size_t buf_size);
+static bool pid_detect_timeout_check(void);
+static bool is_app_in_cluster_list(const char *package_name, char **list, int count);
+static void parse_json_config(const char *buffer, ssize_t len);
+static void force_freeze_all_tasks(void);
+
+static const struct input_device_id fa_ids[] = {
+    { .driver_info = 1 },
+    { }
+};
+
+static struct input_handler fa_input_handler = {
+    .event = fa_input_event,
+    .connect = fa_input_connect,
+    .disconnect = fa_input_disconnect,
+    .name = "frame_aware_unfair",
+    .id_table = fa_ids,
+};
+
+static struct notifier_block fb_notifier = {
+    .notifier_call = fb_notif_call,
+};
+
+static void init_masks(void)
+{
+    int i;
+    cpumask_clear(&little_mask);
+    for (i = LITTLE_START; i <= LITTLE_END; i++) {
+        if (cpu_possible(i))
+            cpumask_set_cpu(i, &little_mask);
+    }
+    cpumask_clear(&big_mask);
+    for (i = BIG_START; i <= BIG_END; i++) {
+        if (cpu_possible(i))
+            cpumask_set_cpu(i, &big_mask);
+    }
+    cpumask_copy(&all_mask, cpu_possible_mask);
+    
+    cpumask_clear(&screen_off_mask);
+    cpumask_set_cpu(0, &screen_off_mask);
+    cpumask_set_cpu(1, &screen_off_mask);
+}
+
+static unsigned int get_cpu_load(int cpu)
+{
+    unsigned long total_time = 0, idle_time = 0;
+    static unsigned long prev_total[NR_CPUS] = {0};
+    static unsigned long prev_idle[NR_CPUS] = {0};
+    unsigned long delta_total, delta_idle;
+    unsigned int load = 0;
+    
+    if (!screen_on)
+        return 0;
+    
+    if (cpu < 0 || cpu >= NR_CPUS)
+        return 0;
+    
+#ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
+    {
+        struct kernel_cpustat *kcpustat;
+        kcpustat = &kcpustat_cpu(cpu);
+        total_time = kcpustat->cpustat[CPUTIME_USER] +
+                     kcpustat->cpustat[CPUTIME_NICE] +
+                     kcpustat->cpustat[CPUTIME_SYSTEM] +
+                     kcpustat->cpustat[CPUTIME_IDLE] +
+                     kcpustat->cpustat[CPUTIME_IOWAIT] +
+                     kcpustat->cpustat[CPUTIME_IRQ] +
+                     kcpustat->cpustat[CPUTIME_SOFTIRQ];
+        idle_time = kcpustat->cpustat[CPUTIME_IDLE] +
+                    kcpustat->cpustat[CPUTIME_IOWAIT];
+    }
+#else
+    total_time = jiffies;
+    idle_time = jiffies / 2;
+#endif
+    if (prev_total[cpu] > 0) {
+        delta_total = total_time - prev_total[cpu];
+        delta_idle = idle_time - prev_idle[cpu];
+        if (delta_total > 0) {
+            load = 100 * (delta_total - delta_idle) / delta_total;
+            if (load > 100) load = 100;
+        } else {
+            load = 0;
+        }
+    } else {
+        load = 0;
+    }
+    prev_total[cpu] = total_time;
+    prev_idle[cpu] = idle_time;
+    return load;
+}
+
+static unsigned int get_big_core_load(void)
+{
+    int cpu;
+    unsigned int total_load = 0;
+    int count = 0;
+    
+    if (!screen_on)
+        return 0;
+    
+    for_each_cpu(cpu, &big_mask) {
+        if (cpu_online(cpu)) {
+            total_load += get_cpu_load(cpu);
+            count++;
+        }
+    }
+    return count > 0 ? (total_load / count) : 0;
+}
+
+static unsigned int get_little_core_load(void)
+{
+    int cpu;
+    unsigned int total_load = 0;
+    int count = 0;
+    
+    if (!screen_on)
+        return 0;
+    
+    for_each_cpu(cpu, &little_mask) {
+        if (cpu_online(cpu)) {
+            total_load += get_cpu_load(cpu);
+            count++;
+        }
+    }
+    return count > 0 ? (total_load / count) : 0;
+}
+
+static void set_cpu_freq(const cpumask_t *mask, unsigned int khz)
+{
+    int cpu;
+    struct cpufreq_policy *policy;
+    
+    if (!screen_on)
+        return;
+    
+#ifdef CONFIG_CPU_FREQ
+    for_each_cpu(cpu, mask) {
+        if (!cpu_online(cpu))
+            continue;
+        policy = cpufreq_cpu_get(cpu);
+        if (!policy)
+            continue;
+        if (policy->cur != khz) {
+            cpufreq_driver_target(policy, khz, CPUFREQ_RELATION_L);
+        }
+        cpufreq_cpu_put(policy);
+    }
+#endif
+}
+
+static void set_all_big_core_freq(unsigned int khz)
+{
+    set_cpu_freq(&big_mask, khz);
+}
+
+static void set_all_little_core_freq(unsigned int khz)
+{
+    set_cpu_freq(&little_mask, khz);
+}
+
+static void online_all_little_cores(void)
+{
+#ifdef CONFIG_HOTPLUG_CPU
+    int cpu;
+    for_each_cpu(cpu, &little_mask) {
+        if (!cpu_online(cpu))
+            cpu_up(cpu);
+    }
+#endif
+}
+
+static void offline_all_little_cores(void)
+{
+#ifdef CONFIG_HOTPLUG_CPU
+    int cpu;
+    for_each_cpu(cpu, &little_mask) {
+        if (cpu_online(cpu) && cpu != 0)
+            cpu_down(cpu);
+    }
+#endif
+}
+
+static void offline_all_big_cores(void)
+{
+#ifdef CONFIG_HOTPLUG_CPU
+    int cpu;
+    for_each_cpu(cpu, &big_mask) {
+        if (cpu_online(cpu))
+            cpu_down(cpu);
+    }
+#endif
+}
+
+static void online_two_little_cores(void)
+{
+#ifdef CONFIG_HOTPLUG_CPU
+    int cpu;
+    int count = 0;
+    for_each_cpu(cpu, &little_mask) {
+        if (!cpu_online(cpu) && count < 2) {
+            cpu_up(cpu);
+            count++;
+        }
+    }
+#endif
+}
 
 static int read_int_from_file(const char *path, int *value)
 {
@@ -470,247 +724,6 @@ static void warning_thermal_restore(void)
             set_user_nice(p, 0);
     }
     rcu_read_unlock();
-}
-
-static void emergency_power_throttle(void);
-static void apply_thermal_throttle(void);
-static unsigned int get_cpu_load(int cpu);
-static void load_config_from_file(void);
-static void free_cluster_apps(void);
-static void unfreeze_all_tasks(void);
-static struct task_info *find_task_info(pid_t pid);
-static void enter_screen_idle_mode(void);
-static void exit_screen_idle_mode(void);
-static void online_all_little_cores(void);
-static void offline_all_little_cores(void);
-static int get_app_cluster_type(const char *package_name);
-static void schedule_app_by_cluster(struct task_struct *p, struct task_info *info, int cluster_type);
-static void schedule_normal_app(struct task_struct *p, struct task_info *info);
-static void adjust_frequencies_with_power(void);
-static void get_cpu_temperature(void);
-static void check_thermal_status(void);
-static void update_task_info(struct task_struct *task);
-static void schedule_screen_off_mode(void);
-static void schedule_screen_on_mode(void);
-static void idle_check_work_func(struct work_struct *work);
-static void check_work_func(struct work_struct *work);
-static void boost_work_func(struct work_struct *work);
-static void screen_off_work_func(struct work_struct *work);
-static void power_check_work_func(struct work_struct *work);
-static void thermal_check_work_func(struct work_struct *work);
-static void boot_complete_work_func(struct work_struct *work);
-static void pid_detect_work_func(struct work_struct *work);
-static int fb_notif_call(struct notifier_block *nb, unsigned long event, void *data);
-static int fa_input_connect(struct input_handler *handler, struct input_dev *dev, const struct input_device_id *id);
-static void fa_input_disconnect(struct input_handle *handle);
-static void fa_input_event(struct input_handle *handle, unsigned int type, unsigned int code, int value);
-static void detect_foreground_pid_safe(void);
-static int read_temperature_from_file(const char *path);
-static bool get_package_name_safe(pid_t pid, char *buf, size_t buf_size);
-static bool pid_detect_timeout_check(void);
-static bool is_app_in_cluster_list(const char *package_name, char **list, int count);
-static void parse_json_config(const char *buffer, ssize_t len);
-
-static const struct input_device_id fa_ids[] = {
-    { .driver_info = 1 },
-    { }
-};
-
-static struct input_handler fa_input_handler = {
-    .event = fa_input_event,
-    .connect = fa_input_connect,
-    .disconnect = fa_input_disconnect,
-    .name = "frame_aware_unfair",
-    .id_table = fa_ids,
-};
-
-static struct notifier_block fb_notifier = {
-    .notifier_call = fb_notif_call,
-};
-
-static void init_masks(void)
-{
-    int i;
-    cpumask_clear(&little_mask);
-    for (i = LITTLE_START; i <= LITTLE_END; i++) {
-        if (cpu_possible(i))
-            cpumask_set_cpu(i, &little_mask);
-    }
-    cpumask_clear(&big_mask);
-    for (i = BIG_START; i <= BIG_END; i++) {
-        if (cpu_possible(i))
-            cpumask_set_cpu(i, &big_mask);
-    }
-    cpumask_copy(&all_mask, cpu_possible_mask);
-    
-    cpumask_clear(&screen_off_mask);
-    cpumask_set_cpu(0, &screen_off_mask);
-    cpumask_set_cpu(1, &screen_off_mask);
-}
-
-static unsigned int get_cpu_load(int cpu)
-{
-    unsigned long total_time = 0, idle_time = 0;
-    static unsigned long prev_total[NR_CPUS] = {0};
-    static unsigned long prev_idle[NR_CPUS] = {0};
-    unsigned long delta_total, delta_idle;
-    unsigned int load = 0;
-    
-    if (!screen_on)
-        return 0;
-    
-    if (cpu < 0 || cpu >= NR_CPUS)
-        return 0;
-    
-#ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
-    {
-        struct kernel_cpustat *kcpustat;
-        kcpustat = &kcpustat_cpu(cpu);
-        total_time = kcpustat->cpustat[CPUTIME_USER] +
-                     kcpustat->cpustat[CPUTIME_NICE] +
-                     kcpustat->cpustat[CPUTIME_SYSTEM] +
-                     kcpustat->cpustat[CPUTIME_IDLE] +
-                     kcpustat->cpustat[CPUTIME_IOWAIT] +
-                     kcpustat->cpustat[CPUTIME_IRQ] +
-                     kcpustat->cpustat[CPUTIME_SOFTIRQ];
-        idle_time = kcpustat->cpustat[CPUTIME_IDLE] +
-                    kcpustat->cpustat[CPUTIME_IOWAIT];
-    }
-#else
-    total_time = jiffies;
-    idle_time = jiffies / 2;
-#endif
-    if (prev_total[cpu] > 0) {
-        delta_total = total_time - prev_total[cpu];
-        delta_idle = idle_time - prev_idle[cpu];
-        if (delta_total > 0) {
-            load = 100 * (delta_total - delta_idle) / delta_total;
-            if (load > 100) load = 100;
-        } else {
-            load = 0;
-        }
-    } else {
-        load = 0;
-    }
-    prev_total[cpu] = total_time;
-    prev_idle[cpu] = idle_time;
-    return load;
-}
-
-static unsigned int get_big_core_load(void)
-{
-    int cpu;
-    unsigned int total_load = 0;
-    int count = 0;
-    
-    if (!screen_on)
-        return 0;
-    
-    for_each_cpu(cpu, &big_mask) {
-        if (cpu_online(cpu)) {
-            total_load += get_cpu_load(cpu);
-            count++;
-        }
-    }
-    return count > 0 ? (total_load / count) : 0;
-}
-
-static unsigned int get_little_core_load(void)
-{
-    int cpu;
-    unsigned int total_load = 0;
-    int count = 0;
-    
-    if (!screen_on)
-        return 0;
-    
-    for_each_cpu(cpu, &little_mask) {
-        if (cpu_online(cpu)) {
-            total_load += get_cpu_load(cpu);
-            count++;
-        }
-    }
-    return count > 0 ? (total_load / count) : 0;
-}
-
-static void set_cpu_freq(const cpumask_t *mask, unsigned int khz)
-{
-    int cpu;
-    struct cpufreq_policy *policy;
-    
-    if (!screen_on)
-        return;
-    
-#ifdef CONFIG_CPU_FREQ
-    for_each_cpu(cpu, mask) {
-        if (!cpu_online(cpu))
-            continue;
-        policy = cpufreq_cpu_get(cpu);
-        if (!policy)
-            continue;
-        if (policy->cur != khz) {
-            cpufreq_driver_target(policy, khz, CPUFREQ_RELATION_L);
-        }
-        cpufreq_cpu_put(policy);
-    }
-#endif
-}
-
-static void set_all_big_core_freq(unsigned int khz)
-{
-    set_cpu_freq(&big_mask, khz);
-}
-
-static void set_all_little_core_freq(unsigned int khz)
-{
-    set_cpu_freq(&little_mask, khz);
-}
-
-static void online_all_little_cores(void)
-{
-#ifdef CONFIG_HOTPLUG_CPU
-    int cpu;
-    for_each_cpu(cpu, &little_mask) {
-        if (!cpu_online(cpu))
-            cpu_up(cpu);
-    }
-#endif
-}
-
-static void offline_all_little_cores(void)
-{
-#ifdef CONFIG_HOTPLUG_CPU
-    int cpu;
-    for_each_cpu(cpu, &little_mask) {
-        if (cpu_online(cpu) && cpu != 0)
-            cpu_down(cpu);
-    }
-#endif
-}
-
-static void offline_all_big_cores(void)
-{
-#ifdef CONFIG_HOTPLUG_CPU
-    int cpu;
-    for_each_cpu(cpu, &big_mask) {
-        if (cpu_online(cpu))
-            cpu_down(cpu);
-    }
-#endif
-}
-
-static void online_two_little_cores(void)
-{
-#ifdef CONFIG_HOTPLUG_CPU
-    int cpu;
-    int count = 0;
-    for_each_cpu(cpu, &little_mask) {
-        if (!cpu_online(cpu) && count < 2) {
-            cpu_up(cpu);
-            count++;
-        }
-    }
-#endif
 }
 
 static bool get_package_name_safe(pid_t pid, char *buf, size_t buf_size)
