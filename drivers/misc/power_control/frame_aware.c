@@ -31,6 +31,10 @@
 #include <linux/pid.h>
 #include <linux/sched/task.h>
 #include <linux/suspend.h>
+#include <linux/of.h>
+#include <linux/platform_device.h>
+#include <linux/regulator/consumer.h>
+#include <linux/iio/consumer.h>
 
 #define APP_CATEGORY_SYSTEM 0
 #define APP_CATEGORY_BACKGROUND 1
@@ -41,29 +45,35 @@
 
 #define LOCK_FREQ_KHZ 300000U
 #define BIG_CORE_IDLE_FREQ_KHZ 300000U
-#define BIG_CORE_MID_FREQ_KHZ 900000U
-#define BIG_CORE_BOOST_KHZ 1500000U
-#define BIG_CORE_MAX_FREQ_KHZ 2000000U
-#define LITTLE_CORE_MIN_KHZ 400000U
-#define LITTLE_CORE_MAX_KHZ 1600000U
+#define BIG_CORE_MID_FREQ_KHZ 600000U
+#define BIG_CORE_BOOST_KHZ 1000000U
+#define BIG_CORE_MAX_FREQ_KHZ 1400000U
+#define LITTLE_CORE_MIN_KHZ 300000U
+#define LITTLE_CORE_MAX_KHZ 1200000U
 
 #define LITTLE_START 0
 #define LITTLE_END 3
 #define BIG_START 4
 #define BIG_END 7
 
-#define BOOST_DURATION_MS 2000
-#define BIG_BOOST_DURATION_MS 4000
+#define BOOST_DURATION_MS 1000
+#define BIG_BOOST_DURATION_MS 2000
 #define SCREEN_OFF_DELAY_MS 1000
-#define IDLE_NO_TOUCH_DELAY_MS 5000
-#define CHECK_INTERVAL_MS 500
-#define POWER_CHECK_INTERVAL_MS 5000
+#define IDLE_NO_TOUCH_DELAY_MS 3000
+#define CHECK_INTERVAL_MS 300
+#define POWER_CHECK_INTERVAL_MS 1000
 #define MAX_TASK_CHECK 50
 
-#define LOAD_THRESHOLD_HIGH 75
+#define LOAD_THRESHOLD_LOW 30
+#define LOAD_THRESHOLD_MID 50
+#define LOAD_THRESHOLD_HIGH 70
 
-#define POWER_THRESHOLD_CRITICAL 5000
-#define TEMP_THRESHOLD_CRITICAL 80
+#define POWER_TARGET_WATTS 3000000
+#define POWER_THRESHOLD_WARNING 2500000
+#define POWER_THRESHOLD_CRITICAL 3000000
+
+#define TEMP_THRESHOLD_WARNING 70
+#define TEMP_THRESHOLD_CRITICAL 75
 
 #define WHITELIST_FILE_PATH "/data/media/0/Android/boost.json"
 #define MAX_WHITELIST_APPS 100
@@ -81,6 +91,10 @@
 #define CLUSTER_TYPE_BIG 1
 #define CLUSTER_TYPE_ALL 2
 
+#define CURRENT_PATH "/sys/class/power_supply/battery/current_now"
+#define VOLTAGE_PATH "/sys/class/power_supply/battery/voltage_now"
+#define POWER_PATH "/sys/class/power_supply/battery/power_now"
+
 static cpumask_t little_mask;
 static cpumask_t big_mask;
 static cpumask_t all_mask;
@@ -90,7 +104,9 @@ static pid_t fg_pid = 0;
 static bool screen_on = true;
 static bool boot_complete = false;
 static bool screen_off_processed = false;
+static bool thermal_warning_mode = false;
 static bool thermal_emergency_mode = false;
+static bool power_warning_mode = false;
 static bool power_emergency_mode = false;
 static bool screen_idle_mode = false;
 static bool input_handler_registered = false;
@@ -101,14 +117,16 @@ static unsigned long power_check_jiffies;
 static unsigned long thermal_check_jiffies;
 static struct kobject *fa_kobj;
 
-static unsigned long last_power_uw = 0;
-static unsigned long avg_power_uw = 0;
-static unsigned long max_power_uw = 0;
-static unsigned long power_samples[10];
+static long last_power_uw = 0;
+static long avg_power_uw = 0;
+static long max_power_uw = 0;
+static long power_samples[20];
 static int power_sample_index = 0;
 static int power_sample_count = 0;
 
 static int last_temperature = 25;
+static int last_current_ma = 0;
+static int last_voltage_mv = 0;
 
 static char **small_cluster_apps = NULL;
 static char **large_cluster_apps = NULL;
@@ -170,6 +188,290 @@ static const char *foreground_process_patterns[] = {
     NULL
 };
 
+static int read_int_from_file(const char *path, int *value)
+{
+    struct file *fp = NULL;
+    loff_t pos = 0;
+    char buffer[32];
+    ssize_t len;
+    int ret = 0;
+    
+    if (!path || !value)
+        return -EINVAL;
+    
+    fp = filp_open(path, O_RDONLY, 0);
+    if (IS_ERR(fp))
+        return PTR_ERR(fp);
+    
+    len = kernel_read(fp, buffer, sizeof(buffer) - 1, &pos);
+    if (len <= 0) {
+        filp_close(fp, NULL);
+        return -EIO;
+    }
+    
+    buffer[len] = '\0';
+    ret = kstrtoint(buffer, 10, value);
+    filp_close(fp, NULL);
+    
+    return ret;
+}
+
+static long get_battery_power_uw(void)
+{
+    int current_ma = 0;
+    int voltage_mv = 0;
+    long power_uw = 0;
+    int ret;
+    
+    ret = read_int_from_file(CURRENT_PATH, &current_ma);
+    if (ret < 0) {
+        ret = read_int_from_file("/sys/class/power_supply/battery/current_now", &current_ma);
+        if (ret < 0)
+            current_ma = 0;
+    }
+    
+    ret = read_int_from_file(VOLTAGE_PATH, &voltage_mv);
+    if (ret < 0) {
+        ret = read_int_from_file("/sys/class/power_supply/battery/voltage_now", &voltage_mv);
+        if (ret < 0)
+            voltage_mv = 3700;
+    }
+    
+    if (current_ma < 0)
+        current_ma = -current_ma;
+    
+    last_current_ma = current_ma;
+    last_voltage_mv = voltage_mv;
+    
+    power_uw = (long)current_ma * voltage_mv * 1000;
+    if (power_uw < 0)
+        power_uw = -power_uw;
+    
+    return power_uw;
+}
+
+static void update_power_statistics(void)
+{
+    long current_power;
+    long sum = 0;
+    int i;
+    
+    if (!screen_on)
+        return;
+    
+    current_power = get_battery_power_uw();
+    
+    if (current_power > 0) {
+        power_samples[power_sample_index] = current_power;
+        power_sample_index = (power_sample_index + 1) % ARRAY_SIZE(power_samples);
+        if (power_sample_count < ARRAY_SIZE(power_samples))
+            power_sample_count++;
+        
+        for (i = 0; i < power_sample_count; i++)
+            sum += power_samples[i];
+        
+        if (power_sample_count)
+            avg_power_uw = sum / power_sample_count;
+        
+        if (current_power > max_power_uw)
+            max_power_uw = current_power;
+        
+        last_power_uw = current_power;
+    }
+    
+    if (avg_power_uw > POWER_THRESHOLD_CRITICAL) {
+        if (!power_emergency_mode && screen_on) {
+            power_emergency_mode = true;
+            power_warning_mode = false;
+        }
+    } else if (avg_power_uw > POWER_THRESHOLD_WARNING) {
+        if (!power_warning_mode && !power_emergency_mode && screen_on) {
+            power_warning_mode = true;
+        }
+    } else if (avg_power_uw < (POWER_THRESHOLD_WARNING - 500000)) {
+        if (power_warning_mode) {
+            power_warning_mode = false;
+        }
+        if (power_emergency_mode && avg_power_uw < (POWER_THRESHOLD_CRITICAL - 1000000)) {
+            power_emergency_mode = false;
+        }
+    }
+}
+
+static void emergency_power_throttle(void)
+{
+    struct task_struct *p;
+    
+    set_all_little_core_freq(LOCK_FREQ_KHZ);
+    set_all_big_core_freq(BIG_CORE_IDLE_FREQ_KHZ);
+    
+    if (!screen_on)
+        return;
+    
+    rcu_read_lock();
+    for_each_process(p) {
+        if (!p->mm || p->flags & PF_KTHREAD)
+            continue;
+        if (p->pid == fg_pid) {
+            set_user_nice(p, 0);
+            set_cpus_allowed_ptr(p, &little_mask);
+        } else {
+            set_user_nice(p, 19);
+            set_cpus_allowed_ptr(p, &screen_off_mask);
+        }
+    }
+    rcu_read_unlock();
+}
+
+static void warning_power_throttle(void)
+{
+    struct task_struct *p;
+    
+    set_all_big_core_freq(BIG_CORE_MID_FREQ_KHZ);
+    set_all_little_core_freq(LITTLE_CORE_MIN_KHZ);
+    
+    if (!screen_on)
+        return;
+    
+    rcu_read_lock();
+    for_each_process(p) {
+        if (!p->mm || p->flags & PF_KTHREAD)
+            continue;
+        if (p->pid == fg_pid)
+            continue;
+        if (p->static_prio < -5)
+            continue;
+        set_user_nice(p, 10);
+        set_cpus_allowed_ptr(p, &little_mask);
+    }
+    rcu_read_unlock();
+}
+
+static void emergency_power_restore(void)
+{
+    struct task_struct *p;
+    
+    if (!screen_on)
+        return;
+    
+    rcu_read_lock();
+    for_each_process(p) {
+        if (!p->mm || p->flags & PF_KTHREAD)
+            continue;
+        if (frozen(p))
+            __thaw_task(p);
+        set_user_nice(p, 0);
+        set_cpus_allowed_ptr(p, &all_mask);
+    }
+    rcu_read_unlock();
+}
+
+static void warning_power_restore(void)
+{
+    struct task_struct *p;
+    
+    if (!screen_on)
+        return;
+    
+    rcu_read_lock();
+    for_each_process(p) {
+        if (!p->mm || p->flags & PF_KTHREAD)
+            continue;
+        if (p->pid == fg_pid)
+            continue;
+        if (p->static_prio >= 10)
+            set_user_nice(p, 0);
+    }
+    rcu_read_unlock();
+}
+
+static void emergency_thermal_throttle(void)
+{
+    struct task_struct *p;
+    
+    set_all_big_core_freq(BIG_CORE_IDLE_FREQ_KHZ);
+    set_all_little_core_freq(LITTLE_CORE_MIN_KHZ);
+    
+    if (!screen_on)
+        return;
+    
+    rcu_read_lock();
+    for_each_process(p) {
+        if (!p->mm || p->flags & PF_KTHREAD)
+            continue;
+        if (p->pid == fg_pid) {
+            set_user_nice(p, 0);
+            set_cpus_allowed_ptr(p, &little_mask);
+        } else {
+            set_user_nice(p, 15);
+            set_cpus_allowed_ptr(p, &screen_off_mask);
+        }
+    }
+    rcu_read_unlock();
+}
+
+static void warning_thermal_throttle(void)
+{
+    struct task_struct *p;
+    
+    set_all_big_core_freq(BIG_CORE_MID_FREQ_KHZ);
+    set_all_little_core_freq(LITTLE_CORE_MIN_KHZ);
+    
+    if (!screen_on)
+        return;
+    
+    rcu_read_lock();
+    for_each_process(p) {
+        if (!p->mm || p->flags & PF_KTHREAD)
+            continue;
+        if (p->pid == fg_pid)
+            continue;
+        if (p->static_prio < -5)
+            continue;
+        set_user_nice(p, 5);
+        set_cpus_allowed_ptr(p, &little_mask);
+    }
+    rcu_read_unlock();
+}
+
+static void emergency_thermal_restore(void)
+{
+    struct task_struct *p;
+    
+    if (!screen_on)
+        return;
+    
+    rcu_read_lock();
+    for_each_process(p) {
+        if (!p->mm || p->flags & PF_KTHREAD)
+            continue;
+        if (frozen(p))
+            __thaw_task(p);
+        set_user_nice(p, 0);
+        set_cpus_allowed_ptr(p, &all_mask);
+    }
+    rcu_read_unlock();
+}
+
+static void warning_thermal_restore(void)
+{
+    struct task_struct *p;
+    
+    if (!screen_on)
+        return;
+    
+    rcu_read_lock();
+    for_each_process(p) {
+        if (!p->mm || p->flags & PF_KTHREAD)
+            continue;
+        if (p->pid == fg_pid)
+            continue;
+        if (p->static_prio >= 5)
+            set_user_nice(p, 0);
+    }
+    rcu_read_unlock();
+}
+
 static void emergency_power_throttle(void);
 static void apply_thermal_throttle(void);
 static unsigned int get_cpu_load(int cpu);
@@ -185,8 +487,7 @@ static int get_app_cluster_type(const char *package_name);
 static void schedule_app_by_cluster(struct task_struct *p, struct task_info *info, int cluster_type);
 static void schedule_normal_app(struct task_struct *p, struct task_info *info);
 static void adjust_frequencies_with_power(void);
-static void update_power_statistics(void);
-static int get_cpu_temperature(void);
+static void get_cpu_temperature(void);
 static void check_thermal_status(void);
 static void update_task_info(struct task_struct *task);
 static void schedule_screen_off_mode(void);
@@ -205,7 +506,6 @@ static void fa_input_disconnect(struct input_handle *handle);
 static void fa_input_event(struct input_handle *handle, unsigned int type, unsigned int code, int value);
 static void detect_foreground_pid_safe(void);
 static int read_temperature_from_file(const char *path);
-static int read_temperature_from_thermal(void);
 static bool get_package_name_safe(pid_t pid, char *buf, size_t buf_size);
 static bool pid_detect_timeout_check(void);
 static bool is_app_in_cluster_list(const char *package_name, char **list, int count);
@@ -233,9 +533,8 @@ static void init_masks(void)
     int i;
     cpumask_clear(&little_mask);
     for (i = LITTLE_START; i <= LITTLE_END; i++) {
-        if (cpu_possible(i)) {
+        if (cpu_possible(i))
             cpumask_set_cpu(i, &little_mask);
-        }
     }
     cpumask_clear(&big_mask);
     for (i = BIG_START; i <= BIG_END; i++) {
@@ -262,7 +561,7 @@ static unsigned int get_cpu_load(int cpu)
     
     if (cpu < 0 || cpu >= NR_CPUS)
         return 0;
-        
+    
 #ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
     {
         struct kernel_cpustat *kcpustat;
@@ -306,7 +605,7 @@ static unsigned int get_big_core_load(void)
     
     if (!screen_on)
         return 0;
-        
+    
     for_each_cpu(cpu, &big_mask) {
         if (cpu_online(cpu)) {
             total_load += get_cpu_load(cpu);
@@ -324,7 +623,7 @@ static unsigned int get_little_core_load(void)
     
     if (!screen_on)
         return 0;
-        
+    
     for_each_cpu(cpu, &little_mask) {
         if (cpu_online(cpu)) {
             total_load += get_cpu_load(cpu);
@@ -341,7 +640,7 @@ static void set_cpu_freq(const cpumask_t *mask, unsigned int khz)
     
     if (!screen_on)
         return;
-        
+    
 #ifdef CONFIG_CPU_FREQ
     for_each_cpu(cpu, mask) {
         if (!cpu_online(cpu))
@@ -425,55 +724,47 @@ static bool get_package_name_safe(pid_t pid, char *buf, size_t buf_size)
     
     if (!buf || buf_size == 0 || buf_size < 2)
         return false;
-        
-    if (pid <= 0 || pid > PID_MAX_LIMIT) {
+    
+    if (pid <= 0 || pid > PID_MAX_LIMIT)
         return false;
-    }
     
     snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
     
     fp = filp_open(path, O_RDONLY | O_NONBLOCK, 0);
-    if (IS_ERR(fp)) {
+    if (IS_ERR(fp))
         return false;
-    }
     
     len = kernel_read(fp, cmdline, sizeof(cmdline) - 1, &pos);
     filp_close(fp, NULL);
     
-    if (len <= 0) {
+    if (len <= 0)
         return false;
-    }
     
     if (len >= (ssize_t)sizeof(cmdline))
         len = sizeof(cmdline) - 1;
     cmdline[len] = '\0';
     
-    if (cmdline[0] == '\0') {
+    if (cmdline[0] == '\0')
         return false;
-    }
     
     pkg_end = strchr(cmdline, ' ');
-    if (pkg_end) {
+    if (pkg_end)
         *pkg_end = '\0';
-    }
     
     pkg_name = strrchr(cmdline, '/');
-    if (pkg_name) {
+    if (pkg_name)
         pkg_name++;
-    } else {
+    else
         pkg_name = cmdline;
-    }
     
-    if (strlen(pkg_name) == 0) {
+    if (strlen(pkg_name) == 0)
         return false;
-    }
     
     strncpy(buf, pkg_name, buf_size - 1);
     buf[buf_size - 1] = '\0';
     
-    if (strlen(buf) < 3) {
+    if (strlen(buf) < 3)
         return false;
-    }
     
     return true;
 }
@@ -484,9 +775,8 @@ static bool is_app_in_cluster_list(const char *package_name, char **list, int co
     if (!package_name || !list)
         return false;
     for (i = 0; i < count; i++) {
-        if (list[i] && strstr(package_name, list[i])) {
+        if (list[i] && strstr(package_name, list[i]))
             return true;
-        }
     }
     return false;
 }
@@ -512,14 +802,13 @@ static void unfreeze_all_tasks(void)
     struct task_info *info;
     
     spin_lock(&task_list_lock);
-    list_for_each_entry(info, &task_list, list) {
+    list_for_each_entry(info, &task_list, list)
         info->is_frozen = false;
-    }
     spin_unlock(&task_list_lock);
     
     if (!screen_on)
         return;
-        
+    
     rcu_read_lock();
     for_each_process(p) {
         if (!p->mm || p->flags & PF_KTHREAD)
@@ -557,13 +846,12 @@ static int get_app_cluster_type(const char *package_name)
     
     mutex_lock(&cluster_lock);
     
-    if (is_app_in_cluster_list(package_name, small_cluster_apps, small_count)) {
+    if (is_app_in_cluster_list(package_name, small_cluster_apps, small_count))
         cluster_type = CLUSTER_TYPE_LITTLE;
-    } else if (is_app_in_cluster_list(package_name, large_cluster_apps, large_count)) {
+    else if (is_app_in_cluster_list(package_name, large_cluster_apps, large_count))
         cluster_type = CLUSTER_TYPE_BIG;
-    } else if (is_app_in_cluster_list(package_name, all_cluster_apps, all_count)) {
+    else if (is_app_in_cluster_list(package_name, all_cluster_apps, all_count))
         cluster_type = CLUSTER_TYPE_ALL;
-    }
     
     mutex_unlock(&cluster_lock);
     return cluster_type;
@@ -580,11 +868,11 @@ static void schedule_app_by_cluster(struct task_struct *p, struct task_info *inf
             set_cpus_allowed_ptr(p, &little_mask);
             break;
         case CLUSTER_TYPE_BIG:
-            set_user_nice(p, -10);
+            set_user_nice(p, -5);
             set_cpus_allowed_ptr(p, &big_mask);
             break;
         case CLUSTER_TYPE_ALL:
-            set_user_nice(p, -20);
+            set_user_nice(p, -10);
             set_cpus_allowed_ptr(p, &all_mask);
             break;
         default:
@@ -612,29 +900,25 @@ static void parse_json_config(const char *buffer, ssize_t len)
     
     line = copy;
     while (*line) {
-        while (*line && (*line == ' ' || *line == '\t' || *line == '\n' ||
-                        *line == '\r')) {
+        while (*line && (*line == ' ' || *line == '\t' || *line == '\n' || *line == '\r'))
             line++;
-        }
         
         if (!*line)
             break;
         
         if (strncmp(line, "\"boost\"", 7) == 0) {
             line += 7;
-            while (*line && (*line == ' ' || *line == '\t' || *line == ':')) {
+            while (*line && (*line == ' ' || *line == '\t' || *line == ':'))
                 line++;
-            }
             if (*line == '"') {
                 line++;
                 end = strchr(line, '"');
                 if (end) {
                     *end = '\0';
-                    if (strcmp(line, "dynamic") == 0) {
+                    if (strcmp(line, "dynamic") == 0)
                         current_mode = MODE_DYNAMIC;
-                    } else if (strcmp(line, "whitelist") == 0) {
+                    else if (strcmp(line, "whitelist") == 0)
                         current_mode = MODE_WHITELIST;
-                    }
                     line = end + 1;
                 }
             }
@@ -643,9 +927,8 @@ static void parse_json_config(const char *buffer, ssize_t len)
         
         if (strncmp(line, "\"small\"", 7) == 0) {
             line += 7;
-            while (*line && (*line == ' ' || *line == '\t' || *line == ':')) {
+            while (*line && (*line == ' ' || *line == '\t' || *line == ':'))
                 line++;
-            }
             if (*line == '[') {
                 line++;
                 in_small_array = 1;
@@ -657,9 +940,8 @@ static void parse_json_config(const char *buffer, ssize_t len)
         
         if (strncmp(line, "\"large\"", 7) == 0) {
             line += 7;
-            while (*line && (*line == ' ' || *line == '\t' || *line == ':')) {
+            while (*line && (*line == ' ' || *line == '\t' || *line == ':'))
                 line++;
-            }
             if (*line == '[') {
                 line++;
                 in_small_array = 0;
@@ -671,9 +953,8 @@ static void parse_json_config(const char *buffer, ssize_t len)
         
         if (strncmp(line, "\"all\"", 5) == 0) {
             line += 5;
-            while (*line && (*line == ' ' || *line == '\t' || *line == ':')) {
+            while (*line && (*line == ' ' || *line == '\t' || *line == ':'))
                 line++;
-            }
             if (*line == '[') {
                 line++;
                 in_small_array = 0;
@@ -710,32 +991,26 @@ static void parse_json_config(const char *buffer, ssize_t len)
                         mutex_lock(&cluster_lock);
                         
                         if (in_small_array && small_count < MAX_WHITELIST_APPS) {
-                            if (!small_cluster_apps) {
+                            if (!small_cluster_apps)
                                 small_cluster_apps = kzalloc(sizeof(char *) * MAX_WHITELIST_APPS, GFP_KERNEL);
-                            }
-                            if (small_cluster_apps) {
+                            if (small_cluster_apps)
                                 small_cluster_apps[small_count++] = app_name;
-                            } else {
+                            else
                                 kfree(app_name);
-                            }
                         } else if (in_large_array && large_count < MAX_WHITELIST_APPS) {
-                            if (!large_cluster_apps) {
+                            if (!large_cluster_apps)
                                 large_cluster_apps = kzalloc(sizeof(char *) * MAX_WHITELIST_APPS, GFP_KERNEL);
-                            }
-                            if (large_cluster_apps) {
+                            if (large_cluster_apps)
                                 large_cluster_apps[large_count++] = app_name;
-                            } else {
+                            else
                                 kfree(app_name);
-                            }
                         } else if (in_all_array && all_count < MAX_WHITELIST_APPS) {
-                            if (!all_cluster_apps) {
+                            if (!all_cluster_apps)
                                 all_cluster_apps = kzalloc(sizeof(char *) * MAX_WHITELIST_APPS, GFP_KERNEL);
-                            }
-                            if (all_cluster_apps) {
+                            if (all_cluster_apps)
                                 all_cluster_apps[all_count++] = app_name;
-                            } else {
+                            else
                                 kfree(app_name);
-                            }
                         } else {
                             kfree(app_name);
                         }
@@ -789,7 +1064,6 @@ static void load_config_from_file(void)
     }
     
     buffer[len] = '\0';
-    
     parse_json_config(buffer, len);
     
     kfree(buffer);
@@ -831,94 +1105,6 @@ static void free_cluster_apps(void)
     }
 }
 
-static unsigned long get_system_power_uw_simple(void)
-{
-    unsigned long power = 0;
-    int cpu;
-    unsigned int freq, load;
-    unsigned long coeff;
-    struct cpufreq_policy *policy;
-    
-    if (!screen_on)
-        return 0;
-        
-    for_each_online_cpu(cpu) {
-        freq = 0;
-#ifdef CONFIG_CPU_FREQ
-        policy = cpufreq_cpu_get(cpu);
-        if (policy) {
-            freq = policy->cur;
-            cpufreq_cpu_put(policy);
-        }
-#endif
-        load = get_cpu_load(cpu);
-        coeff = cpumask_test_cpu(cpu, &big_mask) ? 8 : 3;
-        if (freq == 0)
-            freq = LITTLE_CORE_MIN_KHZ;
-        power += (freq / 1000000) * load * coeff;
-    }
-    return power * 1000;
-}
-
-static void update_power_statistics(void)
-{
-    unsigned long current_power;
-    unsigned long sum = 0;
-    int i;
-    
-    if (!screen_on)
-        return;
-        
-    current_power = get_system_power_uw_simple();
-    
-    power_samples[power_sample_index] = current_power;
-    power_sample_index = (power_sample_index + 1) % ARRAY_SIZE(power_samples);
-    if (power_sample_count < ARRAY_SIZE(power_samples)) {
-        power_sample_count++;
-    }
-    for (i = 0; i < power_sample_count; i++) {
-        sum += power_samples[i];
-    }
-    if (power_sample_count)
-        avg_power_uw = sum / power_sample_count;
-    if (current_power > max_power_uw) {
-        max_power_uw = current_power;
-    }
-    last_power_uw = current_power;
-    
-    if (avg_power_uw > POWER_THRESHOLD_CRITICAL * 1000) {
-        if (!power_emergency_mode && screen_on) {
-            power_emergency_mode = true;
-            emergency_power_throttle();
-        }
-    } else if (avg_power_uw < (POWER_THRESHOLD_CRITICAL - 1000) * 1000) {
-        if (power_emergency_mode) {
-            power_emergency_mode = false;
-            unfreeze_all_tasks();
-        }
-    }
-}
-
-static void emergency_power_throttle(void)
-{
-    struct task_struct *p;
-    
-    set_all_little_core_freq(LOCK_FREQ_KHZ);
-    set_all_big_core_freq(BIG_CORE_IDLE_FREQ_KHZ);
-    
-    if (!screen_on)
-        return;
-        
-    rcu_read_lock();
-    for_each_process(p) {
-        if (!p->mm || p->flags & PF_KTHREAD)
-            continue;
-        set_user_nice(p, 19);
-        set_cpus_allowed_ptr(p, &little_mask);
-    }
-    rcu_read_unlock();
-}
-
 static int read_temperature_from_file(const char *path)
 {
     struct file *fp = NULL;
@@ -926,28 +1112,30 @@ static int read_temperature_from_file(const char *path)
     char buffer[32];
     ssize_t len;
     int temp = 0;
+    int ret;
     
-    fp = filp_open(path, O_RDONLY | O_NONBLOCK, 0);
-    if (IS_ERR(fp)) {
+    fp = filp_open(path, O_RDONLY, 0);
+    if (IS_ERR(fp))
         return -1;
-    }
     
     len = kernel_read(fp, buffer, sizeof(buffer) - 1, &pos);
     filp_close(fp, NULL);
     
-    if (len <= 0) {
+    if (len <= 0)
         return -1;
-    }
     
     buffer[len] = '\0';
-    if (kstrtoint(buffer, 10, &temp) != 0) {
+    ret = kstrtoint(buffer, 10, &temp);
+    if (ret != 0)
         return -1;
-    }
     
-    return temp / 1000;
+    if (temp > 1000)
+        temp = temp / 1000;
+    
+    return temp;
 }
 
-static int read_temperature_from_thermal(void)
+static void get_cpu_temperature(void)
 {
     int temp = -1;
     const char *thermal_paths[] = {
@@ -956,9 +1144,13 @@ static int read_temperature_from_thermal(void)
         "/sys/class/thermal/thermal_zone2/temp",
         "/sys/class/thermal/thermal_zone3/temp",
         "/sys/class/thermal/thermal_zone4/temp",
+        "/sys/class/thermal/thermal_zone5/temp",
+        "/sys/class/thermal/thermal_zone6/temp",
+        "/sys/class/thermal/thermal_zone7/temp",
+        "/sys/devices/virtual/thermal/thermal_zone0/temp",
+        "/sys/devices/virtual/thermal/thermal_zone1/temp",
         "/sys/class/hwmon/hwmon0/temp1_input",
         "/sys/class/hwmon/hwmon1/temp1_input",
-        "/sys/devices/virtual/thermal/thermal_zone0/temp",
         NULL
     };
     int i;
@@ -966,96 +1158,40 @@ static int read_temperature_from_thermal(void)
     for (i = 0; thermal_paths[i] != NULL; i++) {
         temp = read_temperature_from_file(thermal_paths[i]);
         if (temp > 0 && temp < 150) {
-            return temp;
+            last_temperature = temp;
+            return;
         }
     }
     
-    return temp;
-}
-
-static int get_cpu_temperature(void)
-{
-    static int last_valid_temp = 25;
-    int temp = -1;
-    
-#ifdef CONFIG_THERMAL
-    {
-        const char *tz_names[] = {
-            "cpu-thermal",
-            "cpu_thermal",
-            "soc_thermal",
-            "therm_est",
-            "virtual-thermal",
-            "cpu_therm",
-            "soc",
-            NULL
-        };
-        struct thermal_zone_device *tz = NULL;
-        int i;
-        
-        for (i = 0; tz_names[i] != NULL; i++) {
-            tz = thermal_zone_get_zone_by_name(tz_names[i]);
-            if (!IS_ERR(tz)) {
-                int ret = thermal_zone_get_temp(tz, &temp);
-                if (!ret) {
-                    temp = temp / 1000;
-                    if (temp > 0 && temp < 150) {
-                        last_valid_temp = temp;
-                        last_temperature = temp;
-                        return temp;
-                    }
-                }
-            }
-        }
-    }
-#endif
-    
-    temp = read_temperature_from_thermal();
-    if (temp > 0 && temp < 150) {
-        last_valid_temp = temp;
-        last_temperature = temp;
-        return temp;
-    }
-    
-    last_temperature = last_valid_temp;
-    return last_valid_temp;
+    if (temp <= 0 || temp >= 150)
+        last_temperature = 35;
 }
 
 static void check_thermal_status(void)
 {
-    int temp = get_cpu_temperature();
-    if (temp > TEMP_THRESHOLD_CRITICAL) {
+    get_cpu_temperature();
+    
+    if (last_temperature > TEMP_THRESHOLD_CRITICAL) {
         if (!thermal_emergency_mode) {
             thermal_emergency_mode = true;
-            apply_thermal_throttle();
+            thermal_warning_mode = false;
+            emergency_thermal_throttle();
         }
-    } else if (temp < TEMP_THRESHOLD_CRITICAL - 5) {
-        if (thermal_emergency_mode) {
+    } else if (last_temperature > TEMP_THRESHOLD_WARNING) {
+        if (!thermal_warning_mode && !thermal_emergency_mode) {
+            thermal_warning_mode = true;
+            warning_thermal_throttle();
+        }
+    } else if (last_temperature < TEMP_THRESHOLD_WARNING - 5) {
+        if (thermal_warning_mode) {
+            thermal_warning_mode = false;
+            warning_thermal_restore();
+        }
+        if (thermal_emergency_mode && last_temperature < TEMP_THRESHOLD_CRITICAL - 5) {
             thermal_emergency_mode = false;
-            unfreeze_all_tasks();
+            emergency_thermal_restore();
         }
     }
-}
-
-static void apply_thermal_throttle(void)
-{
-    struct task_struct *p;
-    
-    set_all_big_core_freq(BIG_CORE_IDLE_FREQ_KHZ);
-    set_all_little_core_freq(LITTLE_CORE_MIN_KHZ);
-    
-    if (!screen_on)
-        return;
-        
-    rcu_read_lock();
-    for_each_process(p) {
-        if (!p->mm || p->flags & PF_KTHREAD)
-            continue;
-        if (p->static_prio < 0) {
-            set_user_nice(p, 0);
-        }
-    }
-    rcu_read_unlock();
 }
 
 static void update_task_info(struct task_struct *task)
@@ -1066,11 +1202,11 @@ static void update_task_info(struct task_struct *task)
     
     if (!screen_on)
         return;
-        
+    
     is_foreground = (task->pid == fg_pid);
-    if (!get_package_name_safe(task->pid, package_name, sizeof(package_name))) {
+    if (!get_package_name_safe(task->pid, package_name, sizeof(package_name)))
         return;
-    }
+    
     info = find_task_info(task->pid);
     if (!info) {
         info = kzalloc(sizeof(*info), GFP_ATOMIC);
@@ -1183,14 +1319,10 @@ static void schedule_screen_on_mode(void)
     
     if (fa_wq) {
         queue_delayed_work(fa_wq, &check_work, msecs_to_jiffies(CHECK_INTERVAL_MS));
-        queue_delayed_work(fa_wq, &power_check_work,
-                          msecs_to_jiffies(POWER_CHECK_INTERVAL_MS));
-        queue_delayed_work(fa_wq, &idle_check_work,
-                          msecs_to_jiffies(IDLE_NO_TOUCH_DELAY_MS));
-        queue_delayed_work(fa_wq, &pid_detect_work,
-                          msecs_to_jiffies(PID_CHECK_INTERVAL_MS));
-        queue_delayed_work(fa_wq, &thermal_check_work,
-                          msecs_to_jiffies(5000));
+        queue_delayed_work(fa_wq, &power_check_work, msecs_to_jiffies(POWER_CHECK_INTERVAL_MS));
+        queue_delayed_work(fa_wq, &idle_check_work, msecs_to_jiffies(IDLE_NO_TOUCH_DELAY_MS));
+        queue_delayed_work(fa_wq, &pid_detect_work, msecs_to_jiffies(PID_CHECK_INTERVAL_MS));
+        queue_delayed_work(fa_wq, &thermal_check_work, msecs_to_jiffies(5000));
     }
 }
 
@@ -1217,10 +1349,7 @@ static bool pid_detect_timeout_check(void)
     unsigned long now = jiffies;
     unsigned long timeout = msecs_to_jiffies(PID_DETECT_TIMEOUT_MS);
     
-    if (time_after(now, pid_detect_start_jiffies + timeout)) {
-        return true;
-    }
-    return false;
+    return time_after(now, pid_detect_start_jiffies + timeout);
 }
 
 static void detect_foreground_pid_safe(void)
@@ -1233,7 +1362,7 @@ static void detect_foreground_pid_safe(void)
     
     if (!screen_on)
         return;
-        
+    
     spin_lock(&pid_detect_lock);
     if (pid_detect_in_progress) {
         spin_unlock(&pid_detect_lock);
@@ -1245,17 +1374,15 @@ static void detect_foreground_pid_safe(void)
     
     rcu_read_lock();
     for_each_process(p) {
-        if (pid_detect_timeout_check()) {
+        if (pid_detect_timeout_check())
             break;
-        }
         
-        if (process_count++ > MAX_PROCESS_SCAN) {
+        if (process_count++ > MAX_PROCESS_SCAN)
             break;
-        }
         
         if (!p->mm || p->flags & PF_KTHREAD)
             continue;
-            
+        
         if (p->pid <= 100)
             continue;
         
@@ -1292,14 +1419,36 @@ static void schedule_normal_app(struct task_struct *p, struct task_info *info)
     
     if (!screen_on)
         return;
-        
+    
     if (!info)
         return;
+    
+    if (power_emergency_mode || thermal_emergency_mode) {
+        if (p->pid == fg_pid) {
+            set_user_nice(p, 0);
+            set_cpus_allowed_ptr(p, &little_mask);
+        } else {
+            set_user_nice(p, 19);
+            set_cpus_allowed_ptr(p, &screen_off_mask);
+        }
+        return;
+    }
+    
+    if (power_warning_mode || thermal_warning_mode) {
+        if (p->pid == fg_pid) {
+            set_user_nice(p, -5);
+            set_cpus_allowed_ptr(p, &little_mask);
+        } else {
+            set_user_nice(p, 10);
+            set_cpus_allowed_ptr(p, &little_mask);
+        }
+        return;
+    }
     
     now = jiffies;
     boost_end_time = info->app_start_jiffies + msecs_to_jiffies(BOOST_DURATION_MS);
     if (time_before(now, boost_end_time)) {
-        set_user_nice(p, -20);
+        set_user_nice(p, -10);
         set_cpus_allowed_ptr(p, &all_mask);
         return;
     }
@@ -1312,23 +1461,26 @@ static void schedule_normal_app(struct task_struct *p, struct task_info *info)
             if (cluster_type == CLUSTER_TYPE_BIG || cluster_type == CLUSTER_TYPE_ALL) {
                 boost_end_time = info->app_start_jiffies + msecs_to_jiffies(BIG_BOOST_DURATION_MS);
                 if (time_before(now, boost_end_time)) {
-                    set_user_nice(p, -20);
+                    set_user_nice(p, -10);
                     set_cpus_allowed_ptr(p, &all_mask);
                     return;
                 }
             }
         } else {
             unsigned int little_load = get_little_core_load();
-            if (little_load < LOAD_THRESHOLD_HIGH) {
+            if (little_load < LOAD_THRESHOLD_LOW) {
                 set_user_nice(p, 0);
+                set_cpus_allowed_ptr(p, &little_mask);
+            } else if (little_load < LOAD_THRESHOLD_MID) {
+                set_user_nice(p, -2);
                 set_cpus_allowed_ptr(p, &little_mask);
             } else {
                 unsigned int big_load = get_big_core_load();
-                if (big_load < LOAD_THRESHOLD_HIGH) {
-                    set_user_nice(p, -10);
+                if (big_load < LOAD_THRESHOLD_MID) {
+                    set_user_nice(p, -5);
                     set_cpus_allowed_ptr(p, &big_mask);
                 } else {
-                    set_user_nice(p, -20);
+                    set_user_nice(p, -10);
                     set_cpus_allowed_ptr(p, &all_mask);
                 }
             }
@@ -1336,16 +1488,19 @@ static void schedule_normal_app(struct task_struct *p, struct task_info *info)
     } else {
         if (current_mode == MODE_DYNAMIC) {
             unsigned int little_load = get_little_core_load();
-            if (little_load < LOAD_THRESHOLD_HIGH) {
+            if (little_load < LOAD_THRESHOLD_LOW) {
+                set_user_nice(p, 0);
+                set_cpus_allowed_ptr(p, &little_mask);
+            } else if (little_load < LOAD_THRESHOLD_MID) {
                 set_user_nice(p, 0);
                 set_cpus_allowed_ptr(p, &little_mask);
             } else {
                 unsigned int big_load = get_big_core_load();
-                if (big_load < LOAD_THRESHOLD_HIGH) {
-                    set_user_nice(p, -10);
+                if (big_load < LOAD_THRESHOLD_MID) {
+                    set_user_nice(p, -5);
                     set_cpus_allowed_ptr(p, &big_mask);
                 } else {
-                    set_user_nice(p, -20);
+                    set_user_nice(p, -10);
                     set_cpus_allowed_ptr(p, &all_mask);
                 }
             }
@@ -1354,22 +1509,14 @@ static void schedule_normal_app(struct task_struct *p, struct task_info *info)
             set_cpus_allowed_ptr(p, &little_mask);
         }
     }
-    
-    if (power_emergency_mode || thermal_emergency_mode) {
-        if (avg_power_uw > POWER_THRESHOLD_CRITICAL * 1000 || last_temperature > TEMP_THRESHOLD_CRITICAL) {
-            set_user_nice(p, 0);
-            set_cpus_allowed_ptr(p, &all_mask);
-        }
-    }
 }
 
 static void adjust_frequencies_with_power(void)
 {
     unsigned int little_load, big_load;
     
-    if (!screen_on) {
+    if (!screen_on)
         return;
-    }
     
     if (screen_idle_mode) {
         set_all_little_core_freq(LITTLE_CORE_MIN_KHZ);
@@ -1383,25 +1530,33 @@ static void adjust_frequencies_with_power(void)
         return;
     }
     
+    if (power_warning_mode || thermal_warning_mode) {
+        set_all_little_core_freq(LITTLE_CORE_MIN_KHZ);
+        set_all_big_core_freq(BIG_CORE_MID_FREQ_KHZ);
+        return;
+    }
+    
     if (current_mode == MODE_DYNAMIC) {
         little_load = get_little_core_load();
         big_load = get_big_core_load();
         
-        if (little_load < 30) {
+        if (little_load < LOAD_THRESHOLD_LOW)
             set_all_little_core_freq(LITTLE_CORE_MIN_KHZ);
-        } else if (little_load < 60) {
-            set_all_little_core_freq((LITTLE_CORE_MIN_KHZ + LITTLE_CORE_MAX_KHZ) / 2);
-        } else {
+        else if (little_load < LOAD_THRESHOLD_MID)
+            set_all_little_core_freq(600000U);
+        else if (little_load < LOAD_THRESHOLD_HIGH)
+            set_all_little_core_freq(900000U);
+        else
             set_all_little_core_freq(LITTLE_CORE_MAX_KHZ);
-        }
         
-        if (big_load < 30) {
+        if (big_load < LOAD_THRESHOLD_LOW)
             set_all_big_core_freq(BIG_CORE_IDLE_FREQ_KHZ);
-        } else if (big_load < 60) {
+        else if (big_load < LOAD_THRESHOLD_MID)
             set_all_big_core_freq(BIG_CORE_MID_FREQ_KHZ);
-        } else {
+        else if (big_load < LOAD_THRESHOLD_HIGH)
             set_all_big_core_freq(BIG_CORE_BOOST_KHZ);
-        }
+        else
+            set_all_big_core_freq(BIG_CORE_MAX_FREQ_KHZ);
     } else {
         set_all_little_core_freq(LITTLE_CORE_MIN_KHZ);
         set_all_big_core_freq(BIG_CORE_MID_FREQ_KHZ);
@@ -1412,10 +1567,8 @@ static void pid_detect_work_func(struct work_struct *work)
 {
     detect_foreground_pid_safe();
     
-    if (fa_wq && screen_on) {
-        unsigned long interval = msecs_to_jiffies(PID_CHECK_INTERVAL_MS);
-        queue_delayed_work(fa_wq, &pid_detect_work, interval);
-    }
+    if (fa_wq && screen_on)
+        queue_delayed_work(fa_wq, &pid_detect_work, msecs_to_jiffies(PID_CHECK_INTERVAL_MS));
 }
 
 static void idle_check_work_func(struct work_struct *work)
@@ -1425,17 +1578,14 @@ static void idle_check_work_func(struct work_struct *work)
     
     if (!screen_on || screen_idle_mode || screen_off_processed)
         return;
-        
+    
     now = jiffies;
     idle_timeout = msecs_to_jiffies(IDLE_NO_TOUCH_DELAY_MS);
     
-    if (time_after(now, last_touch_jiffies + idle_timeout)) {
+    if (time_after(now, last_touch_jiffies + idle_timeout))
         enter_screen_idle_mode();
-    } else {
-        if (fa_wq)
-            queue_delayed_work(fa_wq, &idle_check_work,
-                              msecs_to_jiffies(IDLE_NO_TOUCH_DELAY_MS));
-    }
+    else if (fa_wq)
+        queue_delayed_work(fa_wq, &idle_check_work, msecs_to_jiffies(IDLE_NO_TOUCH_DELAY_MS));
 }
 
 static void check_work_func(struct work_struct *work)
@@ -1445,7 +1595,7 @@ static void check_work_func(struct work_struct *work)
     
     if (!screen_on)
         return;
-        
+    
     rcu_read_lock();
     for_each_process(task) {
         if (!task->mm || task->flags & PF_KTHREAD)
@@ -1483,52 +1633,77 @@ static void boost_work_func(struct work_struct *work)
     
     if (fg_pid == 0 || !screen_on)
         return;
-        
-    if (screen_idle_mode) {
+    
+    if (screen_idle_mode)
         exit_screen_idle_mode();
-    }
+    
     info = find_task_info(fg_pid);
     if (info) {
         info->last_boost_jiffies = jiffies;
-        if (info->is_whitelisted && current_mode == MODE_WHITELIST) {
-            int cluster_type = info->cluster_type;
-            if (cluster_type == CLUSTER_TYPE_BIG) {
-                set_all_big_core_freq(BIG_CORE_BOOST_KHZ);
-            } else if (cluster_type == CLUSTER_TYPE_ALL) {
-                set_all_big_core_freq(BIG_CORE_MAX_FREQ_KHZ);
-                set_all_little_core_freq(LITTLE_CORE_MAX_KHZ);
-            } else {
+        if (!power_warning_mode && !thermal_warning_mode &&
+            !power_emergency_mode && !thermal_emergency_mode) {
+            if (info->is_whitelisted && current_mode == MODE_WHITELIST) {
+                int cluster_type = info->cluster_type;
+                if (cluster_type == CLUSTER_TYPE_BIG)
+                    set_all_big_core_freq(BIG_CORE_BOOST_KHZ);
+                else if (cluster_type == CLUSTER_TYPE_ALL) {
+                    set_all_big_core_freq(BIG_CORE_MAX_FREQ_KHZ);
+                    set_all_little_core_freq(LITTLE_CORE_MAX_KHZ);
+                } else
+                    set_all_big_core_freq(BIG_CORE_MID_FREQ_KHZ);
+            } else
                 set_all_big_core_freq(BIG_CORE_MID_FREQ_KHZ);
-            }
-        } else {
+        } else
             set_all_big_core_freq(BIG_CORE_MID_FREQ_KHZ);
-        }
     }
 }
 
 static void screen_off_work_func(struct work_struct *work)
 {
-    if (!screen_on && !screen_off_processed) {
+    if (!screen_on && !screen_off_processed)
         schedule_screen_off_mode();
-    }
 }
 
 static void power_check_work_func(struct work_struct *work)
 {
     if (screen_on) {
         update_power_statistics();
+        
+        if (power_emergency_mode)
+            emergency_power_throttle();
+        else if (power_warning_mode)
+            warning_power_throttle();
+        else if (!power_warning_mode && !power_emergency_mode) {
+            if (avg_power_uw < (POWER_THRESHOLD_WARNING - 500000)) {
+                if (power_warning_mode) {
+                    power_warning_mode = false;
+                    warning_power_restore();
+                }
+                if (power_emergency_mode && avg_power_uw < (POWER_THRESHOLD_CRITICAL - 1000000)) {
+                    power_emergency_mode = false;
+                    emergency_power_restore();
+                }
+            }
+        }
+        
         if (fa_wq && screen_on)
-            queue_delayed_work(fa_wq, &power_check_work,
-                              msecs_to_jiffies(POWER_CHECK_INTERVAL_MS));
+            queue_delayed_work(fa_wq, &power_check_work, msecs_to_jiffies(POWER_CHECK_INTERVAL_MS));
     }
 }
 
 static void thermal_check_work_func(struct work_struct *work)
 {
-    check_thermal_status();
-    if (fa_wq && screen_on)
-        queue_delayed_work(fa_wq, &thermal_check_work,
-                          msecs_to_jiffies(5000));
+    if (screen_on) {
+        check_thermal_status();
+        
+        if (thermal_emergency_mode)
+            emergency_thermal_throttle();
+        else if (thermal_warning_mode)
+            warning_thermal_throttle();
+        
+        if (fa_wq && screen_on)
+            queue_delayed_work(fa_wq, &thermal_check_work, msecs_to_jiffies(5000));
+    }
 }
 
 static void boot_complete_work_func(struct work_struct *work)
@@ -1537,9 +1712,8 @@ static void boot_complete_work_func(struct work_struct *work)
     load_config_from_file();
     if (!input_handler_registered && fa_wq) {
         int rc = input_register_handler(&fa_input_handler);
-        if (rc == 0) {
+        if (rc == 0)
             input_handler_registered = true;
-        }
     }
     if (screen_on && fa_wq) {
         queue_delayed_work(fa_wq, &check_work, msecs_to_jiffies(CHECK_INTERVAL_MS));
@@ -1549,15 +1723,16 @@ static void boot_complete_work_func(struct work_struct *work)
     }
 }
 
-static int fb_notif_call(struct notifier_block *nb,
-                         unsigned long event, void *data)
+static int fb_notif_call(struct notifier_block *nb, unsigned long event, void *data)
 {
     int *blankp;
     struct fb_event *evdata = data;
+    
     if (event != FB_EVENT_BLANK)
         return NOTIFY_DONE;
     if (!evdata || !evdata->data)
         return NOTIFY_DONE;
+    
     blankp = evdata->data;
     if (*blankp == FB_BLANK_UNBLANK) {
         if (!screen_on) {
@@ -1579,36 +1754,38 @@ static int fb_notif_call(struct notifier_block *nb,
             cancel_delayed_work(&pid_detect_work);
             cancel_delayed_work(&screen_off_work);
             if (fa_wq)
-                queue_delayed_work(fa_wq, &screen_off_work,
-                                  msecs_to_jiffies(SCREEN_OFF_DELAY_MS));
+                queue_delayed_work(fa_wq, &screen_off_work, msecs_to_jiffies(SCREEN_OFF_DELAY_MS));
         }
     }
     return NOTIFY_OK;
 }
 
-static int fa_input_connect(struct input_handler *handler,
-                            struct input_dev *dev,
-                            const struct input_device_id *id)
+static int fa_input_connect(struct input_handler *handler, struct input_dev *dev, const struct input_device_id *id)
 {
     struct input_handle *h;
     int err;
+    
     h = kzalloc(sizeof(*h), GFP_KERNEL);
     if (!h)
         return -ENOMEM;
+    
     h->dev = dev;
     h->handler = handler;
     h->name = "frame_aware_unfair";
+    
     err = input_register_handle(h);
     if (err) {
         kfree(h);
         return err;
     }
+    
     err = input_open_device(h);
     if (err) {
         input_unregister_handle(h);
         kfree(h);
         return err;
     }
+    
     return 0;
 }
 
@@ -1621,11 +1798,11 @@ static void fa_input_disconnect(struct input_handle *handle)
     kfree(handle);
 }
 
-static void fa_input_event(struct input_handle *handle,
-                           unsigned int type, unsigned int code, int value)
+static void fa_input_event(struct input_handle *handle, unsigned int type, unsigned int code, int value)
 {
     if (!screen_on || !fa_wq)
         return;
+    
     if (type == EV_ABS || type == EV_KEY || type == EV_SYN) {
         last_touch_jiffies = jiffies;
         if (screen_idle_mode) {
@@ -1655,9 +1832,9 @@ static ssize_t application_show(struct kobject *kobj, struct kobj_attribute *att
     }
     
     len += snprintf(buf + len, PAGE_SIZE - len, "\nSmall Cluster Apps (%d):\n", small_count);
-    for (i = 0; i < small_count; i++) {
+    for (i = 0; i < small_count && i < 50; i++) {
         if (small_cluster_apps[i]) {
-            if (len >= PAGE_SIZE - 10) break;
+            if (len >= PAGE_SIZE - 100) break;
             len += snprintf(buf + len, PAGE_SIZE - len, "  - %s\n", small_cluster_apps[i]);
         }
     }
@@ -1668,9 +1845,9 @@ static ssize_t application_show(struct kobject *kobj, struct kobj_attribute *att
     }
     
     len += snprintf(buf + len, PAGE_SIZE - len, "\nLarge Cluster Apps (%d):\n", large_count);
-    for (i = 0; i < large_count; i++) {
+    for (i = 0; i < large_count && i < 50; i++) {
         if (large_cluster_apps[i]) {
-            if (len >= PAGE_SIZE - 10) break;
+            if (len >= PAGE_SIZE - 100) break;
             len += snprintf(buf + len, PAGE_SIZE - len, "  - %s\n", large_cluster_apps[i]);
         }
     }
@@ -1681,26 +1858,23 @@ static ssize_t application_show(struct kobject *kobj, struct kobj_attribute *att
     }
     
     len += snprintf(buf + len, PAGE_SIZE - len, "\nAll Cluster Apps (%d):\n", all_count);
-    for (i = 0; i < all_count; i++) {
+    for (i = 0; i < all_count && i < 50; i++) {
         if (all_cluster_apps[i]) {
-            if (len >= PAGE_SIZE - 10) break;
+            if (len >= PAGE_SIZE - 100) break;
             len += snprintf(buf + len, PAGE_SIZE - len, "  - %s\n", all_cluster_apps[i]);
         }
     }
     
     mutex_unlock(&cluster_lock);
-    
     return len;
 }
 
-static ssize_t application_store(struct kobject *kobj, struct kobj_attribute *attr, 
-                                const char *buf, size_t count)
+static ssize_t application_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
 {
     if (strncmp(buf, "reload", 6) == 0) {
         load_config_from_file();
         return count;
     }
-    
     return -EINVAL;
 }
 
@@ -1711,16 +1885,14 @@ static ssize_t fg_pid_show(struct kobject *k, struct kobj_attribute *a, char *bu
     return snprintf(buf, PAGE_SIZE, "%d\n", fg_pid);
 }
 
-static ssize_t fg_pid_store(struct kobject *k, struct kobj_attribute *a,
-                            const char *buf, size_t count)
+static ssize_t fg_pid_store(struct kobject *k, struct kobj_attribute *a, const char *buf, size_t count)
 {
     pid_t v;
     if (kstrtoint(buf, 10, &v) == 0) {
         mutex_lock(&fg_lock);
         fg_pid = v;
-        if (screen_on && fa_wq) {
+        if (screen_on && fa_wq)
             queue_work(fa_wq, &boost_work);
-        }
         mutex_unlock(&fg_lock);
     }
     return count;
@@ -1729,39 +1901,82 @@ static ssize_t fg_pid_store(struct kobject *k, struct kobj_attribute *a,
 static ssize_t power_monitor_show(struct kobject *k, struct kobj_attribute *a, char *buf)
 {
     int len = 0;
-    unsigned int avg_watts = avg_power_uw / 1000000;
-    unsigned int avg_milliwatts = (avg_power_uw % 1000000) / 1000;
-    unsigned int max_watts = max_power_uw / 1000000;
-    unsigned int max_milliwatts = (max_power_uw % 1000000) / 1000;
+    long avg_watts = avg_power_uw / 1000000;
+    long avg_milliwatts = (avg_power_uw % 1000000) / 1000;
+    long max_watts = max_power_uw / 1000000;
+    long max_milliwatts = (max_power_uw % 1000000) / 1000;
     
-    len += snprintf(buf + len, PAGE_SIZE - len, "Current Power: %lu uW\n", last_power_uw);
+    len += snprintf(buf + len, PAGE_SIZE - len, "=== Power Monitor ===\n");
     if (len >= PAGE_SIZE) return len;
     
-    len += snprintf(buf + len, PAGE_SIZE - len, "Average Power: %u.%03u W\n", avg_watts, avg_milliwatts);
+    len += snprintf(buf + len, PAGE_SIZE - len, "Battery Current: %d mA\n", last_current_ma);
     if (len >= PAGE_SIZE) return len;
     
-    len += snprintf(buf + len, PAGE_SIZE - len, "Max Power: %u.%03u W\n", max_watts, max_milliwatts);
+    len += snprintf(buf + len, PAGE_SIZE - len, "Battery Voltage: %d mV\n", last_voltage_mv);
     if (len >= PAGE_SIZE) return len;
     
-    len += snprintf(buf + len, PAGE_SIZE - len, "Power Emergency Mode: %s\n", power_emergency_mode ? "Yes" : "No");
+    len += snprintf(buf + len, PAGE_SIZE - len, "Current Power: %ld uW (%ld.%03ld W)\n", 
+                    last_power_uw, last_power_uw / 1000000, (last_power_uw % 1000000) / 1000);
     if (len >= PAGE_SIZE) return len;
     
-    len += snprintf(buf + len, PAGE_SIZE - len, "Temperature: %d°C\n", last_temperature);
+    len += snprintf(buf + len, PAGE_SIZE - len, "Average Power: %ld.%03ld W\n", avg_watts, avg_milliwatts);
     if (len >= PAGE_SIZE) return len;
     
-    len += snprintf(buf + len, PAGE_SIZE - len, "Thermal Emergency Mode: %s\n", thermal_emergency_mode ? "Yes" : "No");
+    len += snprintf(buf + len, PAGE_SIZE - len, "Max Power: %ld.%03ld W\n", max_watts, max_milliwatts);
+    if (len >= PAGE_SIZE) return len;
+    
+    len += snprintf(buf + len, PAGE_SIZE - len, "Power Target: 3.000 W\n");
+    if (len >= PAGE_SIZE) return len;
+    
+    len += snprintf(buf + len, PAGE_SIZE - len, "Power Warning Mode: %s\n", power_warning_mode ? "ACTIVE" : "Inactive");
+    if (len >= PAGE_SIZE) return len;
+    
+    len += snprintf(buf + len, PAGE_SIZE - len, "Power Emergency Mode: %s\n", power_emergency_mode ? "ACTIVE" : "Inactive");
+    if (len >= PAGE_SIZE) return len;
+    
+    len += snprintf(buf + len, PAGE_SIZE - len, "\n=== Thermal Status ===\n");
+    if (len >= PAGE_SIZE) return len;
+    
+    len += snprintf(buf + len, PAGE_SIZE - len, "CPU Temperature: %d°C\n", last_temperature);
+    if (len >= PAGE_SIZE) return len;
+    
+    len += snprintf(buf + len, PAGE_SIZE - len, "Thermal Warning: %d°C\n", TEMP_THRESHOLD_WARNING);
+    if (len >= PAGE_SIZE) return len;
+    
+    len += snprintf(buf + len, PAGE_SIZE - len, "Thermal Critical: %d°C\n", TEMP_THRESHOLD_CRITICAL);
+    if (len >= PAGE_SIZE) return len;
+    
+    len += snprintf(buf + len, PAGE_SIZE - len, "Thermal Warning Mode: %s\n", thermal_warning_mode ? "ACTIVE" : "Inactive");
+    if (len >= PAGE_SIZE) return len;
+    
+    len += snprintf(buf + len, PAGE_SIZE - len, "Thermal Emergency Mode: %s\n", thermal_emergency_mode ? "ACTIVE" : "Inactive");
+    if (len >= PAGE_SIZE) return len;
+    
+    len += snprintf(buf + len, PAGE_SIZE - len, "\n=== System Status ===\n");
     if (len >= PAGE_SIZE) return len;
     
     len += snprintf(buf + len, PAGE_SIZE - len, "Screen State: %s\n", screen_on ? "On" : "Off");
     if (len >= PAGE_SIZE) return len;
     
-    len += snprintf(buf + len, PAGE_SIZE - len, "Screen Off Processed: %s\n", screen_off_processed ? "Yes" : "No");
-    if (len >= PAGE_SIZE) return len;
-    
     len += snprintf(buf + len, PAGE_SIZE - len, "Screen Idle Mode: %s\n", screen_idle_mode ? "Yes" : "No");
     if (len >= PAGE_SIZE) return len;
     
+    len += snprintf(buf + len, PAGE_SIZE - len, "Foreground PID: %d\n", fg_pid);
+    if (len >= PAGE_SIZE) return len;
+    
     len += snprintf(buf + len, PAGE_SIZE - len, "Scheduler Mode: %s\n", current_mode == MODE_DYNAMIC ? "Dynamic" : "Whitelist");
+    if (len >= PAGE_SIZE) return len;
+    
+    len += snprintf(buf + len, PAGE_SIZE - len, "\n=== CPU Status ===\n");
+    if (len >= PAGE_SIZE) return len;
+    
+    len += snprintf(buf + len, PAGE_SIZE - len, "Little Core Load: %d%%\n", get_little_core_load());
+    if (len >= PAGE_SIZE) return len;
+    
+    len += snprintf(buf + len, PAGE_SIZE - len, "Big Core Load: %d%%\n", get_big_core_load());
+    if (len >= PAGE_SIZE) return len;
+    
+    len += snprintf(buf + len, PAGE_SIZE - len, "\n=== Whitelist Stats ===\n");
     if (len >= PAGE_SIZE) return len;
     
     len += snprintf(buf + len, PAGE_SIZE - len, "Small Cluster Apps: %d\n", small_count);
@@ -1775,8 +1990,7 @@ static ssize_t power_monitor_show(struct kobject *k, struct kobj_attribute *a, c
     return len;
 }
 
-static ssize_t power_monitor_store(struct kobject *k, struct kobj_attribute *a,
-                                   const char *buf, size_t count)
+static ssize_t power_monitor_store(struct kobject *k, struct kobj_attribute *a, const char *buf, size_t count)
 {
     return count;
 }
@@ -1786,7 +2000,6 @@ static struct kobj_attribute power_attr = __ATTR(power_monitor, 0644, power_moni
 
 static int __init fa_init(void)
 {
-    int rc;
     init_masks();
     spin_lock_init(&task_list_lock);
     INIT_LIST_HEAD(&task_list);
@@ -1794,9 +2007,9 @@ static int __init fa_init(void)
     spin_lock_init(&pid_detect_lock);
     
     fa_wq = alloc_workqueue("frame_aware_wq", WQ_FREEZABLE | WQ_MEM_RECLAIM | WQ_UNBOUND, 1);
-    if (!fa_wq) {
+    if (!fa_wq)
         return -ENOMEM;
-    }
+    
     INIT_DELAYED_WORK(&check_work, check_work_func);
     INIT_DELAYED_WORK(&screen_off_work, screen_off_work_func);
     INIT_WORK(&boost_work, boost_work_func);
@@ -1805,22 +2018,27 @@ static int __init fa_init(void)
     INIT_DELAYED_WORK(&thermal_check_work, thermal_check_work_func);
     INIT_DELAYED_WORK(&idle_check_work, idle_check_work_func);
     INIT_DELAYED_WORK(&pid_detect_work, pid_detect_work_func);
-    rc = fb_register_client(&fb_notifier);
+    
+    fb_register_client(&fb_notifier);
+    
     fa_kobj = kobject_create_and_add("frame_aware", kernel_kobj);
     if (fa_kobj) {
         sysfs_create_file(fa_kobj, &fg_attr.attr);
         sysfs_create_file(fa_kobj, &power_attr.attr);
         sysfs_create_file(fa_kobj, &application_attr.attr);
     }
+    
     last_touch_jiffies = jiffies;
     screen_on = true;
     power_check_jiffies = jiffies;
     thermal_check_jiffies = jiffies;
+    
     if (fa_wq) {
         queue_delayed_work(fa_wq, &thermal_check_work, msecs_to_jiffies(5000));
         queue_delayed_work(fa_wq, &boot_complete_work, msecs_to_jiffies(30000));
         queue_delayed_work(fa_wq, &pid_detect_work, msecs_to_jiffies(1000));
     }
+    
     return 0;
 }
 
@@ -1828,6 +2046,7 @@ static void __exit fa_exit(void)
 {
     struct task_info *info, *tmp;
     struct app_profile *profile, *ptmp;
+    
     cancel_delayed_work_sync(&check_work);
     cancel_delayed_work_sync(&screen_off_work);
     cancel_work_sync(&boost_work);
@@ -1836,6 +2055,7 @@ static void __exit fa_exit(void)
     cancel_delayed_work_sync(&thermal_check_work);
     cancel_delayed_work_sync(&idle_check_work);
     cancel_delayed_work_sync(&pid_detect_work);
+    
     if (fa_wq) {
         flush_workqueue(fa_wq);
         destroy_workqueue(fa_wq);
@@ -1847,18 +2067,23 @@ static void __exit fa_exit(void)
         kfree(info);
     }
     spin_unlock(&task_list_lock);
+    
     spin_lock(&app_profiles_lock);
     list_for_each_entry_safe(profile, ptmp, &app_profiles, list) {
         list_del(&profile->list);
         kfree(profile);
     }
     spin_unlock(&app_profiles_lock);
+    
     free_cluster_apps();
+    
     if (input_handler_registered) {
         input_unregister_handler(&fa_input_handler);
         input_handler_registered = false;
     }
+    
     fb_unregister_client(&fb_notifier);
+    
     if (fa_kobj) {
         sysfs_remove_file(fa_kobj, &fg_attr.attr);
         sysfs_remove_file(fa_kobj, &power_attr.attr);
@@ -1872,4 +2097,4 @@ module_exit(fa_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Frame Aware Scheduler");
-MODULE_DESCRIPTION("Cluster-aware task scheduler with dynamic/whitelist modes");
+MODULE_DESCRIPTION("Cluster-aware task scheduler with power/thermal management");
