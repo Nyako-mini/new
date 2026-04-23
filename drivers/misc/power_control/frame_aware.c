@@ -31,6 +31,7 @@
 #include <linux/pid.h>
 #include <linux/sched/task.h>
 #include <linux/suspend.h>
+#include <linux/stat.h>
 
 #define APP_CATEGORY_SYSTEM 0
 #define APP_CATEGORY_BACKGROUND 1
@@ -275,12 +276,15 @@ static void init_masks(void)
 
 static unsigned int get_cpu_load(int cpu)
 {
-    struct rq *rq;
-    unsigned long now = jiffies;
-    static unsigned long prev_idle[NR_CPUS] = {0};
-    static unsigned long prev_total[NR_CPUS] = {0};
-    unsigned long idle, total;
+    static u64 prev_idle[NR_CPUS] = {0};
+    static u64 prev_total[NR_CPUS] = {0};
+    u64 idle, total;
     unsigned int load = 0;
+    struct file *fp;
+    char buf[64];
+    loff_t pos;
+    ssize_t len;
+    char *endptr;
     
     if (!screen_on)
         return 0;
@@ -288,16 +292,45 @@ static unsigned int get_cpu_load(int cpu)
     if (cpu < 0 || cpu >= NR_CPUS)
         return 0;
     
-    rq = cpu_rq(cpu);
-    if (!rq)
+    snprintf(buf, sizeof(buf), "/proc/stat");
+    fp = filp_open(buf, O_RDONLY, 0);
+    if (IS_ERR(fp))
         return 0;
     
-    idle = rq->idle_stamp ? (now - rq->idle_stamp) : 0;
-    total = now - rq->age_stamp;
+    pos = 0;
+    memset(buf, 0, sizeof(buf));
+    len = kernel_read(fp, buf, sizeof(buf) - 1, &pos);
+    filp_close(fp, NULL);
+    
+    if (len <= 0)
+        return 0;
+    
+    total = 0;
+    idle = 0;
+    
+    if (strstr(buf, "cpu")) {
+        char *line = buf;
+        char *token;
+        int i = 0;
+        
+        while (*line && *line == ' ') line++;
+        token = strsep(&line, " ");
+        if (token && strncmp(token, "cpu", 3) == 0) {
+            for (i = 0; i < 4; i++) {
+                token = strsep(&line, " ");
+                if (token) {
+                    u64 val = simple_strtoull(token, &endptr, 10);
+                    total += val;
+                    if (i == 3)
+                        idle = val;
+                }
+            }
+        }
+    }
     
     if (prev_total[cpu] > 0 && total > prev_total[cpu]) {
-        unsigned long delta_total = total - prev_total[cpu];
-        unsigned long delta_idle = idle - prev_idle[cpu];
+        u64 delta_total = total - prev_total[cpu];
+        u64 delta_idle = idle - prev_idle[cpu];
         if (delta_total > 0) {
             load = 100 * (delta_total - delta_idle) / delta_total;
             if (load > 100) load = 100;
