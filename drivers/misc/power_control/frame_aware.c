@@ -276,28 +276,25 @@ static void init_masks(void)
 
 static unsigned int get_cpu_load(int cpu)
 {
-    static u64 prev_idle[NR_CPUS] = {0};
-    static u64 prev_total[NR_CPUS] = {0};
-    u64 idle, total;
-    unsigned int load = 0;
     struct file *fp;
-    char buf[64];
-    loff_t pos;
+    char buf[256];
+    char search[32];
+    char *line;
+    loff_t pos = 0;
     ssize_t len;
-    char *endptr;
+    unsigned long user, nice, system, idle, iowait, irq, softirq, steal;
+    static unsigned long prev_total[NR_CPUS] = {0};
+    static unsigned long prev_idle[NR_CPUS] = {0};
+    unsigned long total, idle_time;
+    unsigned int load = 0;
     
     if (!screen_on)
         return 0;
     
-    if (cpu < 0 || cpu >= NR_CPUS)
-        return 0;
-    
-    snprintf(buf, sizeof(buf), "/proc/stat");
-    fp = filp_open(buf, O_RDONLY, 0);
+    fp = filp_open("/proc/stat", O_RDONLY, 0);
     if (IS_ERR(fp))
         return 0;
     
-    pos = 0;
     memset(buf, 0, sizeof(buf));
     len = kernel_read(fp, buf, sizeof(buf) - 1, &pos);
     filp_close(fp, NULL);
@@ -305,32 +302,20 @@ static unsigned int get_cpu_load(int cpu)
     if (len <= 0)
         return 0;
     
-    total = 0;
-    idle = 0;
+    snprintf(search, sizeof(search), "cpu%d", cpu);
+    line = strstr(buf, search);
+    if (!line)
+        return 0;
     
-    if (strstr(buf, "cpu")) {
-        char *line = buf;
-        char *token;
-        int i = 0;
-        
-        while (*line && *line == ' ') line++;
-        token = strsep(&line, " ");
-        if (token && strncmp(token, "cpu", 3) == 0) {
-            for (i = 0; i < 4; i++) {
-                token = strsep(&line, " ");
-                if (token) {
-                    u64 val = simple_strtoull(token, &endptr, 10);
-                    total += val;
-                    if (i == 3)
-                        idle = val;
-                }
-            }
-        }
-    }
+    sscanf(line, "%*s %lu %lu %lu %lu %lu %lu %lu %lu",
+           &user, &nice, &system, &idle, &iowait, &irq, &softirq, &steal);
     
-    if (prev_total[cpu] > 0 && total > prev_total[cpu]) {
-        u64 delta_total = total - prev_total[cpu];
-        u64 delta_idle = idle - prev_idle[cpu];
+    total = user + nice + system + idle + iowait + irq + softirq + steal;
+    idle_time = idle + iowait;
+    
+    if (prev_total[cpu] > 0) {
+        unsigned long delta_total = total - prev_total[cpu];
+        unsigned long delta_idle = idle_time - prev_idle[cpu];
         if (delta_total > 0) {
             load = 100 * (delta_total - delta_idle) / delta_total;
             if (load > 100) load = 100;
@@ -338,7 +323,7 @@ static unsigned int get_cpu_load(int cpu)
     }
     
     prev_total[cpu] = total;
-    prev_idle[cpu] = idle;
+    prev_idle[cpu] = idle_time;
     
     return load;
 }
@@ -467,7 +452,6 @@ static long get_battery_power_uw(void)
     loff_t pos = 0;
     char buffer[32];
     ssize_t len;
-    char *endptr;
     
     fp = filp_open("/sys/class/power_supply/battery/current_now", O_RDONLY, 0);
     if (!IS_ERR(fp)) {
@@ -477,21 +461,7 @@ static long get_battery_power_uw(void)
         filp_close(fp, NULL);
         if (len > 0) {
             buffer[len] = '\0';
-            current_ma = simple_strtol(buffer, &endptr, 10);
-        }
-    }
-    
-    if (current_ma == 0) {
-        fp = filp_open("/sys/class/power_supply/bms/current_now", O_RDONLY, 0);
-        if (!IS_ERR(fp)) {
-            pos = 0;
-            memset(buffer, 0, sizeof(buffer));
-            len = kernel_read(fp, buffer, sizeof(buffer) - 1, &pos);
-            filp_close(fp, NULL);
-            if (len > 0) {
-                buffer[len] = '\0';
-                current_ma = simple_strtol(buffer, &endptr, 10);
-            }
+            current_ma = simple_strtol(buffer, NULL, 10);
         }
     }
     
@@ -506,21 +476,7 @@ static long get_battery_power_uw(void)
         filp_close(fp, NULL);
         if (len > 0) {
             buffer[len] = '\0';
-            voltage_mv = simple_strtol(buffer, &endptr, 10);
-        }
-    }
-    
-    if (voltage_mv == 0) {
-        fp = filp_open("/sys/class/power_supply/bms/voltage_now", O_RDONLY, 0);
-        if (!IS_ERR(fp)) {
-            pos = 0;
-            memset(buffer, 0, sizeof(buffer));
-            len = kernel_read(fp, buffer, sizeof(buffer) - 1, &pos);
-            filp_close(fp, NULL);
-            if (len > 0) {
-                buffer[len] = '\0';
-                voltage_mv = simple_strtol(buffer, &endptr, 10);
-            }
+            voltage_mv = simple_strtol(buffer, NULL, 10);
         }
     }
     
@@ -765,13 +721,12 @@ static bool get_package_name_safe(pid_t pid, char *buf, size_t buf_size)
     struct file *fp = NULL;
     loff_t pos = 0;
     ssize_t len;
-    char cmdline[MAX_CMD_LINE_LEN];
-    char *pkg_end, *pkg_name;
+    char *p;
     
-    if (!buf || buf_size == 0 || buf_size < 2)
+    if (!buf || buf_size == 0)
         return false;
     
-    if (pid <= 0 || pid > PID_MAX_LIMIT)
+    if (pid <= 0)
         return false;
     
     snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
@@ -780,34 +735,32 @@ static bool get_package_name_safe(pid_t pid, char *buf, size_t buf_size)
     if (IS_ERR(fp))
         return false;
     
-    pos = 0;
-    memset(cmdline, 0, sizeof(cmdline));
-    len = kernel_read(fp, cmdline, sizeof(cmdline) - 1, &pos);
+    memset(buf, 0, buf_size);
+    len = kernel_read(fp, buf, buf_size - 1, &pos);
     filp_close(fp, NULL);
     
     if (len <= 0)
         return false;
     
-    pkg_end = strchr(cmdline, ' ');
-    if (pkg_end)
-        *pkg_end = '\0';
+    for (p = buf; *p; p++) {
+        if (*p == '/')
+            continue;
+    }
     
-    pkg_name = strrchr(cmdline, '/');
-    if (pkg_name)
-        pkg_name++;
-    else
-        pkg_name = cmdline;
+    if (strlen(buf) == 0) {
+        snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+        fp = filp_open(path, O_RDONLY, 0);
+        if (!IS_ERR(fp)) {
+            pos = 0;
+            memset(buf, 0, buf_size);
+            len = kernel_read(fp, buf, buf_size - 1, &pos);
+            filp_close(fp, NULL);
+            if (len > 0 && buf[len-1] == '\n')
+                buf[len-1] = '\0';
+        }
+    }
     
-    if (strlen(pkg_name) == 0)
-        return false;
-    
-    strncpy(buf, pkg_name, buf_size - 1);
-    buf[buf_size - 1] = '\0';
-    
-    if (strlen(buf) < 3)
-        return false;
-    
-    return true;
+    return strlen(buf) > 0;
 }
 
 static bool is_app_in_cluster_list(const char *package_name, char **list, int count)
@@ -1068,6 +1021,9 @@ static void parse_json_config(const char *buffer, ssize_t len)
     }
     
     kfree(copy);
+    
+    printk(KERN_INFO "fa: parsed config - small:%d large:%d all:%d mode:%d\n", 
+           small_count, large_count, all_count, current_mode);
 }
 
 static void load_config_from_file(void)
@@ -1080,10 +1036,11 @@ static void load_config_from_file(void)
     mutex_lock(&cluster_lock);
     
     free_cluster_apps();
-    current_mode = MODE_DYNAMIC;
     
     fp = filp_open(WHITELIST_FILE_PATH, O_RDONLY, 0);
     if (IS_ERR(fp)) {
+        printk(KERN_WARNING "fa: cannot open %s, error %ld\n", 
+               WHITELIST_FILE_PATH, PTR_ERR(fp));
         mutex_unlock(&cluster_lock);
         return;
     }
@@ -1100,12 +1057,14 @@ static void load_config_from_file(void)
     filp_close(fp, NULL);
     
     if (len <= 0) {
+        printk(KERN_WARNING "fa: read config file failed, len=%zd\n", len);
         kfree(buffer);
         mutex_unlock(&cluster_lock);
         return;
     }
     
     buffer[len] = '\0';
+    printk(KERN_INFO "fa: loaded config file, size=%zd\n", len);
     parse_json_config(buffer, len);
     
     kfree(buffer);
@@ -1154,7 +1113,6 @@ static int read_temperature_from_file(const char *path)
     char buffer[32];
     ssize_t len;
     int temp = 0;
-    char *endptr;
     
     fp = filp_open(path, O_RDONLY, 0);
     if (IS_ERR(fp))
@@ -1169,7 +1127,7 @@ static int read_temperature_from_file(const char *path)
         return -1;
     
     buffer[len] = '\0';
-    temp = simple_strtol(buffer, &endptr, 10);
+    temp = simple_strtol(buffer, NULL, 10);
     
     if (temp > 1000)
         temp = temp / 1000;
@@ -1632,7 +1590,7 @@ static void check_work_func(struct work_struct *work)
     struct task_struct *task;
     
     if (!screen_on)
-        return;
+        goto reschedule;
     
     rcu_read_lock();
     for_each_process(task) {
@@ -1660,7 +1618,8 @@ static void check_work_func(struct work_struct *work)
         rcu_read_unlock();
     }
     spin_unlock(&task_list_lock);
-    
+
+reschedule:
     if (fa_wq && screen_on)
         queue_delayed_work(fa_wq, &check_work, msecs_to_jiffies(CHECK_INTERVAL_MS));
 }
@@ -2055,6 +2014,7 @@ static int __init fa_init(void)
         queue_delayed_work(fa_wq, &pid_detect_work, msecs_to_jiffies(1000));
     }
     
+    printk(KERN_INFO "fa: initialized, config path: %s\n", WHITELIST_FILE_PATH);
     return 0;
 }
 
