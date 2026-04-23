@@ -31,6 +31,10 @@
 #include <linux/pid.h>
 #include <linux/sched/task.h>
 #include <linux/suspend.h>
+#include <linux/of.h>
+#include <linux/platform_device.h>
+#include <linux/regulator/consumer.h>
+#include <linux/iio/consumer.h>
 
 #define APP_CATEGORY_SYSTEM 0
 #define APP_CATEGORY_BACKGROUND 1
@@ -41,35 +45,35 @@
 
 #define LOCK_FREQ_KHZ 300000U
 #define BIG_CORE_IDLE_FREQ_KHZ 300000U
-#define BIG_CORE_MID_FREQ_KHZ 600000U
-#define BIG_CORE_BOOST_KHZ 1000000U
-#define BIG_CORE_MAX_FREQ_KHZ 1400000U
+#define BIG_CORE_MID_FREQ_KHZ 400000U
+#define BIG_CORE_BOOST_KHZ 700000U
+#define BIG_CORE_MAX_FREQ_KHZ 900000U
 #define LITTLE_CORE_MIN_KHZ 300000U
-#define LITTLE_CORE_MAX_KHZ 1200000U
+#define LITTLE_CORE_MAX_KHZ 800000U
 
 #define LITTLE_START 0
 #define LITTLE_END 3
 #define BIG_START 4
 #define BIG_END 7
 
-#define BOOST_DURATION_MS 1000
-#define BIG_BOOST_DURATION_MS 2000
+#define BOOST_DURATION_MS 500
+#define BIG_BOOST_DURATION_MS 1000
 #define SCREEN_OFF_DELAY_MS 1000
-#define IDLE_NO_TOUCH_DELAY_MS 3000
-#define CHECK_INTERVAL_MS 300
-#define POWER_CHECK_INTERVAL_MS 1000
+#define IDLE_NO_TOUCH_DELAY_MS 2000
+#define CHECK_INTERVAL_MS 200
+#define POWER_CHECK_INTERVAL_MS 2000
 #define MAX_TASK_CHECK 50
 
-#define LOAD_THRESHOLD_LOW 30
-#define LOAD_THRESHOLD_MID 50
-#define LOAD_THRESHOLD_HIGH 70
+#define LOAD_THRESHOLD_LOW 25
+#define LOAD_THRESHOLD_MID 45
+#define LOAD_THRESHOLD_HIGH 60
 
-#define POWER_TARGET_WATTS 3000000
-#define POWER_THRESHOLD_WARNING 2500000
-#define POWER_THRESHOLD_CRITICAL 3000000
+#define POWER_TARGET_WATTS 2000000
+#define POWER_THRESHOLD_WARNING 1800000
+#define POWER_THRESHOLD_CRITICAL 2000000
 
-#define TEMP_THRESHOLD_WARNING 70
-#define TEMP_THRESHOLD_CRITICAL 75
+#define TEMP_THRESHOLD_WARNING 65
+#define TEMP_THRESHOLD_CRITICAL 70
 
 #define WHITELIST_FILE_PATH "/data/media/0/Android/boost.json"
 #define MAX_WHITELIST_APPS 100
@@ -86,9 +90,6 @@
 #define CLUSTER_TYPE_LITTLE 0
 #define CLUSTER_TYPE_BIG 1
 #define CLUSTER_TYPE_ALL 2
-
-#define CURRENT_PATH "/sys/class/power_supply/battery/current_now"
-#define VOLTAGE_PATH "/sys/class/power_supply/battery/voltage_now"
 
 static cpumask_t little_mask;
 static cpumask_t big_mask;
@@ -115,13 +116,13 @@ static struct kobject *fa_kobj;
 static long last_power_uw = 0;
 static long avg_power_uw = 0;
 static long max_power_uw = 0;
-static long power_samples[20];
+static long power_samples[10];
 static int power_sample_index = 0;
 static int power_sample_count = 0;
 
 static int last_temperature = 25;
-static int last_current_ma = 0;
-static int last_voltage_mv = 0;
+static int last_current_ua = 0;
+static int last_voltage_uv = 0;
 
 static char **small_cluster_apps = NULL;
 static char **large_cluster_apps = NULL;
@@ -194,7 +195,6 @@ static void online_all_little_cores(void);
 static void offline_all_little_cores(void);
 static void offline_all_big_cores(void);
 static void online_two_little_cores(void);
-static int read_int_from_file(const char *path, int *value);
 static long get_battery_power_uw(void);
 static void update_power_statistics(void);
 static void emergency_power_throttle(void);
@@ -233,6 +233,7 @@ static int fa_input_connect(struct input_handler *handler, struct input_dev *dev
 static void fa_input_disconnect(struct input_handle *handle);
 static void fa_input_event(struct input_handle *handle, unsigned int type, unsigned int code, int value);
 static void detect_foreground_pid_safe(void);
+static int read_int_from_file(const char *path, int *value);
 static int read_temperature_from_file(const char *path);
 static bool get_package_name_safe(pid_t pid, char *buf, size_t buf_size);
 static bool pid_detect_timeout_check(void);
@@ -274,7 +275,6 @@ static void init_masks(void)
     
     cpumask_clear(&screen_off_mask);
     cpumask_set_cpu(0, &screen_off_mask);
-    cpumask_set_cpu(1, &screen_off_mask);
 }
 
 static unsigned int get_cpu_load(int cpu)
@@ -472,34 +472,49 @@ static int read_int_from_file(const char *path, int *value)
 
 static long get_battery_power_uw(void)
 {
-    int current_ma = 0;
-    int voltage_mv = 0;
+    int current_ua = 0;
+    int voltage_uv = 0;
     long power_uw = 0;
-    int ret;
+    const char *current_paths[] = {
+        "/sys/class/power_supply/battery/current_now",
+        "/sys/class/power_supply/battery/current_avg",
+        "/sys/class/power_supply/battery/current_max",
+        "/sys/class/power_supply/battery/current_ua",
+        "/sys/class/power_supply/battery/current_avg_ua",
+        NULL
+    };
+    const char *voltage_paths[] = {
+        "/sys/class/power_supply/battery/voltage_now",
+        "/sys/class/power_supply/battery/voltage_avg",
+        "/sys/class/power_supply/battery/voltage_uv",
+        "/sys/class/power_supply/battery/voltage_avg_uv",
+        NULL
+    };
+    int i;
     
-    ret = read_int_from_file(CURRENT_PATH, &current_ma);
-    if (ret < 0) {
-        ret = read_int_from_file("/sys/class/power_supply/battery/current_now", &current_ma);
-        if (ret < 0)
-            current_ma = 0;
+    for (i = 0; current_paths[i] != NULL; i++) {
+        if (read_int_from_file(current_paths[i], &current_ua) == 0 && current_ua != 0) {
+            if (current_ua < 0)
+                current_ua = -current_ua;
+            break;
+        }
     }
     
-    ret = read_int_from_file(VOLTAGE_PATH, &voltage_mv);
-    if (ret < 0) {
-        ret = read_int_from_file("/sys/class/power_supply/battery/voltage_now", &voltage_mv);
-        if (ret < 0)
-            voltage_mv = 3700;
+    for (i = 0; voltage_paths[i] != NULL; i++) {
+        if (read_int_from_file(voltage_paths[i], &voltage_uv) == 0 && voltage_uv != 0) {
+            break;
+        }
     }
     
-    if (current_ma < 0)
-        current_ma = -current_ma;
+    if (voltage_uv == 0)
+        voltage_uv = 3700000;
     
-    last_current_ma = current_ma;
-    last_voltage_mv = voltage_mv;
+    last_current_ua = current_ua;
+    last_voltage_uv = voltage_uv;
     
-    power_uw = (long)current_ma * voltage_mv * 1000;
+    power_uw = ((long)current_ua * voltage_uv) / 1000000;
     if (power_uw < 0)
-        power_uw = -power_uw;
+        power_uw = 0;
     
     return power_uw;
 }
@@ -515,7 +530,7 @@ static void update_power_statistics(void)
     
     current_power = get_battery_power_uw();
     
-    if (current_power > 0) {
+    if (current_power > 0 && current_power < 10000000) {
         power_samples[power_sample_index] = current_power;
         power_sample_index = (power_sample_index + 1) % ARRAY_SIZE(power_samples);
         if (power_sample_count < ARRAY_SIZE(power_samples))
@@ -537,17 +552,21 @@ static void update_power_statistics(void)
         if (!power_emergency_mode && screen_on) {
             power_emergency_mode = true;
             power_warning_mode = false;
+            emergency_power_throttle();
         }
     } else if (avg_power_uw > POWER_THRESHOLD_WARNING) {
         if (!power_warning_mode && !power_emergency_mode && screen_on) {
             power_warning_mode = true;
+            warning_power_throttle();
         }
-    } else if (avg_power_uw < (POWER_THRESHOLD_WARNING - 500000)) {
+    } else if (avg_power_uw < (POWER_THRESHOLD_WARNING - 300000)) {
         if (power_warning_mode) {
             power_warning_mode = false;
+            warning_power_restore();
         }
-        if (power_emergency_mode && avg_power_uw < (POWER_THRESHOLD_CRITICAL - 1000000)) {
+        if (power_emergency_mode && avg_power_uw < (POWER_THRESHOLD_CRITICAL - 500000)) {
             power_emergency_mode = false;
+            emergency_power_restore();
         }
     }
 }
@@ -558,6 +577,7 @@ static void emergency_power_throttle(void)
     
     set_all_little_core_freq(LOCK_FREQ_KHZ);
     set_all_big_core_freq(BIG_CORE_IDLE_FREQ_KHZ);
+    offline_all_big_cores();
     
     if (!screen_on)
         return;
@@ -572,6 +592,8 @@ static void emergency_power_throttle(void)
         } else {
             set_user_nice(p, 19);
             set_cpus_allowed_ptr(p, &screen_off_mask);
+            if (!freeze_task(p))
+                set_cpus_allowed_ptr(p, &screen_off_mask);
         }
     }
     rcu_read_unlock();
@@ -593,9 +615,7 @@ static void warning_power_throttle(void)
             continue;
         if (p->pid == fg_pid)
             continue;
-        if (p->static_prio < -5)
-            continue;
-        set_user_nice(p, 10);
+        set_user_nice(p, 15);
         set_cpus_allowed_ptr(p, &little_mask);
     }
     rcu_read_unlock();
@@ -607,6 +627,8 @@ static void emergency_power_restore(void)
     
     if (!screen_on)
         return;
+    
+    online_all_little_cores();
     
     rcu_read_lock();
     for_each_process(p) {
@@ -633,8 +655,8 @@ static void warning_power_restore(void)
             continue;
         if (p->pid == fg_pid)
             continue;
-        if (p->static_prio >= 10)
-            set_user_nice(p, 0);
+        set_user_nice(p, 0);
+        set_cpus_allowed_ptr(p, &all_mask);
     }
     rcu_read_unlock();
 }
@@ -645,6 +667,7 @@ static void emergency_thermal_throttle(void)
     
     set_all_big_core_freq(BIG_CORE_IDLE_FREQ_KHZ);
     set_all_little_core_freq(LITTLE_CORE_MIN_KHZ);
+    offline_all_big_cores();
     
     if (!screen_on)
         return;
@@ -657,7 +680,7 @@ static void emergency_thermal_throttle(void)
             set_user_nice(p, 0);
             set_cpus_allowed_ptr(p, &little_mask);
         } else {
-            set_user_nice(p, 15);
+            set_user_nice(p, 19);
             set_cpus_allowed_ptr(p, &screen_off_mask);
         }
     }
@@ -680,9 +703,7 @@ static void warning_thermal_throttle(void)
             continue;
         if (p->pid == fg_pid)
             continue;
-        if (p->static_prio < -5)
-            continue;
-        set_user_nice(p, 5);
+        set_user_nice(p, 10);
         set_cpus_allowed_ptr(p, &little_mask);
     }
     rcu_read_unlock();
@@ -694,6 +715,8 @@ static void emergency_thermal_restore(void)
     
     if (!screen_on)
         return;
+    
+    online_all_little_cores();
     
     rcu_read_lock();
     for_each_process(p) {
@@ -720,8 +743,8 @@ static void warning_thermal_restore(void)
             continue;
         if (p->pid == fg_pid)
             continue;
-        if (p->static_prio >= 5)
-            set_user_nice(p, 0);
+        set_user_nice(p, 0);
+        set_cpus_allowed_ptr(p, &all_mask);
     }
     rcu_read_unlock();
 }
@@ -881,11 +904,11 @@ static void schedule_app_by_cluster(struct task_struct *p, struct task_info *inf
             set_cpus_allowed_ptr(p, &little_mask);
             break;
         case CLUSTER_TYPE_BIG:
-            set_user_nice(p, -5);
+            set_user_nice(p, -2);
             set_cpus_allowed_ptr(p, &big_mask);
             break;
         case CLUSTER_TYPE_ALL:
-            set_user_nice(p, -10);
+            set_user_nice(p, -5);
             set_cpus_allowed_ptr(p, &all_mask);
             break;
         default:
@@ -1300,15 +1323,11 @@ static void schedule_screen_on_mode(void)
 {
     struct task_struct *p;
     struct task_info *info;
-    int i;
     
     online_all_little_cores();
     
     cpumask_clear(&screen_off_mask);
-    for (i = BIG_START; i <= BIG_START + 1; i++) {
-        if (cpu_possible(i))
-            cpumask_set_cpu(i, &screen_off_mask);
-    }
+    cpumask_set_cpu(0, &screen_off_mask);
     
     rcu_read_lock();
     for_each_process(p) {
@@ -1346,6 +1365,7 @@ static void enter_screen_idle_mode(void)
     screen_idle_mode = true;
     set_all_big_core_freq(BIG_CORE_IDLE_FREQ_KHZ);
     set_all_little_core_freq(LITTLE_CORE_MIN_KHZ);
+    offline_all_big_cores();
 }
 
 static void exit_screen_idle_mode(void)
@@ -1449,7 +1469,7 @@ static void schedule_normal_app(struct task_struct *p, struct task_info *info)
     
     if (power_warning_mode || thermal_warning_mode) {
         if (p->pid == fg_pid) {
-            set_user_nice(p, -5);
+            set_user_nice(p, -2);
             set_cpus_allowed_ptr(p, &little_mask);
         } else {
             set_user_nice(p, 10);
@@ -1461,8 +1481,8 @@ static void schedule_normal_app(struct task_struct *p, struct task_info *info)
     now = jiffies;
     boost_end_time = info->app_start_jiffies + msecs_to_jiffies(BOOST_DURATION_MS);
     if (time_before(now, boost_end_time)) {
-        set_user_nice(p, -10);
-        set_cpus_allowed_ptr(p, &all_mask);
+        set_user_nice(p, -5);
+        set_cpus_allowed_ptr(p, &little_mask);
         return;
     }
     
@@ -1474,8 +1494,8 @@ static void schedule_normal_app(struct task_struct *p, struct task_info *info)
             if (cluster_type == CLUSTER_TYPE_BIG || cluster_type == CLUSTER_TYPE_ALL) {
                 boost_end_time = info->app_start_jiffies + msecs_to_jiffies(BIG_BOOST_DURATION_MS);
                 if (time_before(now, boost_end_time)) {
-                    set_user_nice(p, -10);
-                    set_cpus_allowed_ptr(p, &all_mask);
+                    set_user_nice(p, -5);
+                    set_cpus_allowed_ptr(p, &little_mask);
                     return;
                 }
             }
@@ -1485,48 +1505,22 @@ static void schedule_normal_app(struct task_struct *p, struct task_info *info)
                 set_user_nice(p, 0);
                 set_cpus_allowed_ptr(p, &little_mask);
             } else if (little_load < LOAD_THRESHOLD_MID) {
-                set_user_nice(p, -2);
+                set_user_nice(p, 0);
                 set_cpus_allowed_ptr(p, &little_mask);
             } else {
-                unsigned int big_load = get_big_core_load();
-                if (big_load < LOAD_THRESHOLD_MID) {
-                    set_user_nice(p, -5);
-                    set_cpus_allowed_ptr(p, &big_mask);
-                } else {
-                    set_user_nice(p, -10);
-                    set_cpus_allowed_ptr(p, &all_mask);
-                }
+                set_user_nice(p, -2);
+                set_cpus_allowed_ptr(p, &little_mask);
             }
         }
     } else {
-        if (current_mode == MODE_DYNAMIC) {
-            unsigned int little_load = get_little_core_load();
-            if (little_load < LOAD_THRESHOLD_LOW) {
-                set_user_nice(p, 0);
-                set_cpus_allowed_ptr(p, &little_mask);
-            } else if (little_load < LOAD_THRESHOLD_MID) {
-                set_user_nice(p, 0);
-                set_cpus_allowed_ptr(p, &little_mask);
-            } else {
-                unsigned int big_load = get_big_core_load();
-                if (big_load < LOAD_THRESHOLD_MID) {
-                    set_user_nice(p, -5);
-                    set_cpus_allowed_ptr(p, &big_mask);
-                } else {
-                    set_user_nice(p, -10);
-                    set_cpus_allowed_ptr(p, &all_mask);
-                }
-            }
-        } else {
-            set_user_nice(p, 0);
-            set_cpus_allowed_ptr(p, &little_mask);
-        }
+        set_user_nice(p, 0);
+        set_cpus_allowed_ptr(p, &little_mask);
     }
 }
 
 static void adjust_frequencies_with_power(void)
 {
-    unsigned int little_load, big_load;
+    unsigned int little_load;
     
     if (!screen_on)
         return;
@@ -1549,31 +1543,19 @@ static void adjust_frequencies_with_power(void)
         return;
     }
     
-    if (current_mode == MODE_DYNAMIC) {
-        little_load = get_little_core_load();
-        big_load = get_big_core_load();
-        
-        if (little_load < LOAD_THRESHOLD_LOW)
-            set_all_little_core_freq(LITTLE_CORE_MIN_KHZ);
-        else if (little_load < LOAD_THRESHOLD_MID)
-            set_all_little_core_freq(600000U);
-        else if (little_load < LOAD_THRESHOLD_HIGH)
-            set_all_little_core_freq(900000U);
-        else
-            set_all_little_core_freq(LITTLE_CORE_MAX_KHZ);
-        
-        if (big_load < LOAD_THRESHOLD_LOW)
-            set_all_big_core_freq(BIG_CORE_IDLE_FREQ_KHZ);
-        else if (big_load < LOAD_THRESHOLD_MID)
-            set_all_big_core_freq(BIG_CORE_MID_FREQ_KHZ);
-        else if (big_load < LOAD_THRESHOLD_HIGH)
-            set_all_big_core_freq(BIG_CORE_BOOST_KHZ);
-        else
-            set_all_big_core_freq(BIG_CORE_MAX_FREQ_KHZ);
-    } else {
+    little_load = get_little_core_load();
+    
+    if (little_load < LOAD_THRESHOLD_LOW)
         set_all_little_core_freq(LITTLE_CORE_MIN_KHZ);
-        set_all_big_core_freq(BIG_CORE_MID_FREQ_KHZ);
-    }
+    else if (little_load < LOAD_THRESHOLD_MID)
+        set_all_little_core_freq(500000U);
+    else if (little_load < LOAD_THRESHOLD_HIGH)
+        set_all_little_core_freq(600000U);
+    else
+        set_all_little_core_freq(LITTLE_CORE_MAX_KHZ);
+    
+    set_all_big_core_freq(BIG_CORE_IDLE_FREQ_KHZ);
+    offline_all_big_cores();
 }
 
 static void pid_detect_work_func(struct work_struct *work)
@@ -1655,19 +1637,8 @@ static void boost_work_func(struct work_struct *work)
         info->last_boost_jiffies = jiffies;
         if (!power_warning_mode && !thermal_warning_mode &&
             !power_emergency_mode && !thermal_emergency_mode) {
-            if (info->is_whitelisted && current_mode == MODE_WHITELIST) {
-                int cluster_type = info->cluster_type;
-                if (cluster_type == CLUSTER_TYPE_BIG)
-                    set_all_big_core_freq(BIG_CORE_BOOST_KHZ);
-                else if (cluster_type == CLUSTER_TYPE_ALL) {
-                    set_all_big_core_freq(BIG_CORE_MAX_FREQ_KHZ);
-                    set_all_little_core_freq(LITTLE_CORE_MAX_KHZ);
-                } else
-                    set_all_big_core_freq(BIG_CORE_MID_FREQ_KHZ);
-            } else
-                set_all_big_core_freq(BIG_CORE_MID_FREQ_KHZ);
-        } else
-            set_all_big_core_freq(BIG_CORE_MID_FREQ_KHZ);
+            set_all_little_core_freq(600000U);
+        }
     }
 }
 
@@ -1686,18 +1657,6 @@ static void power_check_work_func(struct work_struct *work)
             emergency_power_throttle();
         else if (power_warning_mode)
             warning_power_throttle();
-        else if (!power_warning_mode && !power_emergency_mode) {
-            if (avg_power_uw < (POWER_THRESHOLD_WARNING - 500000)) {
-                if (power_warning_mode) {
-                    power_warning_mode = false;
-                    warning_power_restore();
-                }
-                if (power_emergency_mode && avg_power_uw < (POWER_THRESHOLD_CRITICAL - 1000000)) {
-                    power_emergency_mode = false;
-                    emergency_power_restore();
-                }
-            }
-        }
         
         if (fa_wq && screen_on)
             queue_delayed_work(fa_wq, &power_check_work, msecs_to_jiffies(POWER_CHECK_INTERVAL_MS));
@@ -1918,18 +1877,22 @@ static ssize_t power_monitor_show(struct kobject *k, struct kobj_attribute *a, c
     long avg_milliwatts = (avg_power_uw % 1000000) / 1000;
     long max_watts = max_power_uw / 1000000;
     long max_milliwatts = (max_power_uw % 1000000) / 1000;
+    long current_watts = last_power_uw / 1000000;
+    long current_milliwatts = (last_power_uw % 1000000) / 1000;
     
-    len += snprintf(buf + len, PAGE_SIZE - len, "=== Power Monitor ===\n");
+    len += snprintf(buf + len, PAGE_SIZE - len, "=== Real Power Monitor ===\n");
     if (len >= PAGE_SIZE) return len;
     
-    len += snprintf(buf + len, PAGE_SIZE - len, "Battery Current: %d mA\n", last_current_ma);
+    len += snprintf(buf + len, PAGE_SIZE - len, "Battery Current: %d uA (%d mA)\n", 
+                    last_current_ua, last_current_ua / 1000);
     if (len >= PAGE_SIZE) return len;
     
-    len += snprintf(buf + len, PAGE_SIZE - len, "Battery Voltage: %d mV\n", last_voltage_mv);
+    len += snprintf(buf + len, PAGE_SIZE - len, "Battery Voltage: %d uV (%d mV)\n", 
+                    last_voltage_uv, last_voltage_uv / 1000);
     if (len >= PAGE_SIZE) return len;
     
-    len += snprintf(buf + len, PAGE_SIZE - len, "Current Power: %ld uW (%ld.%03ld W)\n", 
-                    last_power_uw, last_power_uw / 1000000, (last_power_uw % 1000000) / 1000);
+    len += snprintf(buf + len, PAGE_SIZE - len, "Current Power: %ld.%03ld W\n", 
+                    current_watts, current_milliwatts);
     if (len >= PAGE_SIZE) return len;
     
     len += snprintf(buf + len, PAGE_SIZE - len, "Average Power: %ld.%03ld W\n", avg_watts, avg_milliwatts);
@@ -1938,7 +1901,7 @@ static ssize_t power_monitor_show(struct kobject *k, struct kobj_attribute *a, c
     len += snprintf(buf + len, PAGE_SIZE - len, "Max Power: %ld.%03ld W\n", max_watts, max_milliwatts);
     if (len >= PAGE_SIZE) return len;
     
-    len += snprintf(buf + len, PAGE_SIZE - len, "Power Target: 3.000 W\n");
+    len += snprintf(buf + len, PAGE_SIZE - len, "Power Limit: 2.000 W\n");
     if (len >= PAGE_SIZE) return len;
     
     len += snprintf(buf + len, PAGE_SIZE - len, "Power Warning Mode: %s\n", power_warning_mode ? "ACTIVE" : "Inactive");
@@ -1953,34 +1916,10 @@ static ssize_t power_monitor_show(struct kobject *k, struct kobj_attribute *a, c
     len += snprintf(buf + len, PAGE_SIZE - len, "CPU Temperature: %d°C\n", last_temperature);
     if (len >= PAGE_SIZE) return len;
     
-    len += snprintf(buf + len, PAGE_SIZE - len, "Thermal Warning: %d°C\n", TEMP_THRESHOLD_WARNING);
-    if (len >= PAGE_SIZE) return len;
-    
-    len += snprintf(buf + len, PAGE_SIZE - len, "Thermal Critical: %d°C\n", TEMP_THRESHOLD_CRITICAL);
-    if (len >= PAGE_SIZE) return len;
-    
-    len += snprintf(buf + len, PAGE_SIZE - len, "Thermal Warning Mode: %s\n", thermal_warning_mode ? "ACTIVE" : "Inactive");
-    if (len >= PAGE_SIZE) return len;
-    
-    len += snprintf(buf + len, PAGE_SIZE - len, "Thermal Emergency Mode: %s\n", thermal_emergency_mode ? "ACTIVE" : "Inactive");
-    if (len >= PAGE_SIZE) return len;
-    
     len += snprintf(buf + len, PAGE_SIZE - len, "\n=== System Status ===\n");
     if (len >= PAGE_SIZE) return len;
     
     len += snprintf(buf + len, PAGE_SIZE - len, "Screen State: %s\n", screen_on ? "On" : "Off");
-    if (len >= PAGE_SIZE) return len;
-    
-    len += snprintf(buf + len, PAGE_SIZE - len, "Screen Idle Mode: %s\n", screen_idle_mode ? "Yes" : "No");
-    if (len >= PAGE_SIZE) return len;
-    
-    len += snprintf(buf + len, PAGE_SIZE - len, "Foreground PID: %d\n", fg_pid);
-    if (len >= PAGE_SIZE) return len;
-    
-    len += snprintf(buf + len, PAGE_SIZE - len, "Scheduler Mode: %s\n", current_mode == MODE_DYNAMIC ? "Dynamic" : "Whitelist");
-    if (len >= PAGE_SIZE) return len;
-    
-    len += snprintf(buf + len, PAGE_SIZE - len, "\n=== CPU Status ===\n");
     if (len >= PAGE_SIZE) return len;
     
     len += snprintf(buf + len, PAGE_SIZE - len, "Little Core Load: %d%%\n", get_little_core_load());
@@ -1989,16 +1928,7 @@ static ssize_t power_monitor_show(struct kobject *k, struct kobj_attribute *a, c
     len += snprintf(buf + len, PAGE_SIZE - len, "Big Core Load: %d%%\n", get_big_core_load());
     if (len >= PAGE_SIZE) return len;
     
-    len += snprintf(buf + len, PAGE_SIZE - len, "\n=== Whitelist Stats ===\n");
-    if (len >= PAGE_SIZE) return len;
-    
-    len += snprintf(buf + len, PAGE_SIZE - len, "Small Cluster Apps: %d\n", small_count);
-    if (len >= PAGE_SIZE) return len;
-    
-    len += snprintf(buf + len, PAGE_SIZE - len, "Large Cluster Apps: %d\n", large_count);
-    if (len >= PAGE_SIZE) return len;
-    
-    len += snprintf(buf + len, PAGE_SIZE - len, "All Cluster Apps: %d\n", all_count);
+    len += snprintf(buf + len, PAGE_SIZE - len, "Foreground PID: %d\n", fg_pid);
     
     return len;
 }
@@ -2110,4 +2040,4 @@ module_exit(fa_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Frame Aware Scheduler");
-MODULE_DESCRIPTION("Cluster-aware task scheduler with power/thermal management");
+MODULE_DESCRIPTION("Cluster-aware task scheduler with strict power control");
