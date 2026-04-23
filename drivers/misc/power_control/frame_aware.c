@@ -275,10 +275,11 @@ static void init_masks(void)
 
 static unsigned int get_cpu_load(int cpu)
 {
-    unsigned long total_time = 0, idle_time = 0;
-    static unsigned long prev_total[NR_CPUS] = {0};
+    struct rq *rq;
+    unsigned long now = jiffies;
     static unsigned long prev_idle[NR_CPUS] = {0};
-    unsigned long delta_total, delta_idle;
+    static unsigned long prev_total[NR_CPUS] = {0};
+    unsigned long idle, total;
     unsigned int load = 0;
     
     if (!screen_on)
@@ -287,38 +288,25 @@ static unsigned int get_cpu_load(int cpu)
     if (cpu < 0 || cpu >= NR_CPUS)
         return 0;
     
-#ifdef CONFIG_VIRT_CPU_ACCOUNTING_GEN
-    {
-        struct kernel_cpustat *kcpustat;
-        kcpustat = &kcpustat_cpu(cpu);
-        total_time = kcpustat->cpustat[CPUTIME_USER] +
-                     kcpustat->cpustat[CPUTIME_NICE] +
-                     kcpustat->cpustat[CPUTIME_SYSTEM] +
-                     kcpustat->cpustat[CPUTIME_IDLE] +
-                     kcpustat->cpustat[CPUTIME_IOWAIT] +
-                     kcpustat->cpustat[CPUTIME_IRQ] +
-                     kcpustat->cpustat[CPUTIME_SOFTIRQ];
-        idle_time = kcpustat->cpustat[CPUTIME_IDLE] +
-                    kcpustat->cpustat[CPUTIME_IOWAIT];
-    }
-#else
-    total_time = jiffies;
-    idle_time = jiffies / 2;
-#endif
-    if (prev_total[cpu] > 0) {
-        delta_total = total_time - prev_total[cpu];
-        delta_idle = idle_time - prev_idle[cpu];
+    rq = cpu_rq(cpu);
+    if (!rq)
+        return 0;
+    
+    idle = rq->idle_stamp ? (now - rq->idle_stamp) : 0;
+    total = now - rq->age_stamp;
+    
+    if (prev_total[cpu] > 0 && total > prev_total[cpu]) {
+        unsigned long delta_total = total - prev_total[cpu];
+        unsigned long delta_idle = idle - prev_idle[cpu];
         if (delta_total > 0) {
             load = 100 * (delta_total - delta_idle) / delta_total;
             if (load > 100) load = 100;
-        } else {
-            load = 0;
         }
-    } else {
-        load = 0;
     }
-    prev_total[cpu] = total_time;
-    prev_idle[cpu] = idle_time;
+    
+    prev_total[cpu] = total;
+    prev_idle[cpu] = idle;
+    
     return load;
 }
 
@@ -446,27 +434,31 @@ static long get_battery_power_uw(void)
     loff_t pos = 0;
     char buffer[32];
     ssize_t len;
+    char *endptr;
     
     fp = filp_open("/sys/class/power_supply/battery/current_now", O_RDONLY, 0);
     if (!IS_ERR(fp)) {
+        pos = 0;
+        memset(buffer, 0, sizeof(buffer));
         len = kernel_read(fp, buffer, sizeof(buffer) - 1, &pos);
+        filp_close(fp, NULL);
         if (len > 0) {
             buffer[len] = '\0';
-            kstrtoint(buffer, 10, &current_ma);
+            current_ma = simple_strtol(buffer, &endptr, 10);
         }
-        filp_close(fp, NULL);
     }
     
     if (current_ma == 0) {
-        fp = filp_open("/sys/class/power_supply/battery/current_now", O_RDONLY, 0);
+        fp = filp_open("/sys/class/power_supply/bms/current_now", O_RDONLY, 0);
         if (!IS_ERR(fp)) {
             pos = 0;
+            memset(buffer, 0, sizeof(buffer));
             len = kernel_read(fp, buffer, sizeof(buffer) - 1, &pos);
+            filp_close(fp, NULL);
             if (len > 0) {
                 buffer[len] = '\0';
-                kstrtoint(buffer, 10, &current_ma);
+                current_ma = simple_strtol(buffer, &endptr, 10);
             }
-            filp_close(fp, NULL);
         }
     }
     
@@ -476,24 +468,26 @@ static long get_battery_power_uw(void)
     fp = filp_open("/sys/class/power_supply/battery/voltage_now", O_RDONLY, 0);
     if (!IS_ERR(fp)) {
         pos = 0;
+        memset(buffer, 0, sizeof(buffer));
         len = kernel_read(fp, buffer, sizeof(buffer) - 1, &pos);
+        filp_close(fp, NULL);
         if (len > 0) {
             buffer[len] = '\0';
-            kstrtoint(buffer, 10, &voltage_mv);
+            voltage_mv = simple_strtol(buffer, &endptr, 10);
         }
-        filp_close(fp, NULL);
     }
     
     if (voltage_mv == 0) {
-        fp = filp_open("/sys/class/power_supply/battery/voltage_now", O_RDONLY, 0);
+        fp = filp_open("/sys/class/power_supply/bms/voltage_now", O_RDONLY, 0);
         if (!IS_ERR(fp)) {
             pos = 0;
+            memset(buffer, 0, sizeof(buffer));
             len = kernel_read(fp, buffer, sizeof(buffer) - 1, &pos);
+            filp_close(fp, NULL);
             if (len > 0) {
                 buffer[len] = '\0';
-                kstrtoint(buffer, 10, &voltage_mv);
+                voltage_mv = simple_strtol(buffer, &endptr, 10);
             }
-            filp_close(fp, NULL);
         }
     }
     
@@ -503,7 +497,7 @@ static long get_battery_power_uw(void)
     last_current_ma = current_ma;
     last_voltage_mv = voltage_mv;
     
-    return (long)current_ma * voltage_mv * 1000;
+    return (long)current_ma * voltage_mv;
 }
 
 static void update_power_statistics(void)
@@ -749,21 +743,16 @@ static bool get_package_name_safe(pid_t pid, char *buf, size_t buf_size)
     
     snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
     
-    fp = filp_open(path, O_RDONLY | O_NONBLOCK, 0);
+    fp = filp_open(path, O_RDONLY, 0);
     if (IS_ERR(fp))
         return false;
     
+    pos = 0;
+    memset(cmdline, 0, sizeof(cmdline));
     len = kernel_read(fp, cmdline, sizeof(cmdline) - 1, &pos);
     filp_close(fp, NULL);
     
     if (len <= 0)
-        return false;
-    
-    if (len >= (ssize_t)sizeof(cmdline))
-        len = sizeof(cmdline) - 1;
-    cmdline[len] = '\0';
-    
-    if (cmdline[0] == '\0')
         return false;
     
     pkg_end = strchr(cmdline, ' ');
@@ -1073,6 +1062,7 @@ static void load_config_from_file(void)
         return;
     }
     
+    pos = 0;
     len = kernel_read(fp, buffer, MAX_JSON_FILE_SIZE - 1, &pos);
     filp_close(fp, NULL);
     
@@ -1131,12 +1121,14 @@ static int read_temperature_from_file(const char *path)
     char buffer[32];
     ssize_t len;
     int temp = 0;
-    int ret;
+    char *endptr;
     
     fp = filp_open(path, O_RDONLY, 0);
     if (IS_ERR(fp))
         return -1;
     
+    pos = 0;
+    memset(buffer, 0, sizeof(buffer));
     len = kernel_read(fp, buffer, sizeof(buffer) - 1, &pos);
     filp_close(fp, NULL);
     
@@ -1144,9 +1136,7 @@ static int read_temperature_from_file(const char *path)
         return -1;
     
     buffer[len] = '\0';
-    ret = kstrtoint(buffer, 10, &temp);
-    if (ret != 0)
-        return -1;
+    temp = simple_strtol(buffer, &endptr, 10);
     
     if (temp > 1000)
         temp = temp / 1000;
@@ -1166,10 +1156,6 @@ static void get_cpu_temperature(void)
         "/sys/class/thermal/thermal_zone5/temp",
         "/sys/class/thermal/thermal_zone6/temp",
         "/sys/class/thermal/thermal_zone7/temp",
-        "/sys/devices/virtual/thermal/thermal_zone0/temp",
-        "/sys/devices/virtual/thermal/thermal_zone1/temp",
-        "/sys/class/hwmon/hwmon0/temp1_input",
-        "/sys/class/hwmon/hwmon1/temp1_input",
         NULL
     };
     int i;
