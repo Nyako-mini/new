@@ -2,6 +2,7 @@
 #include <linux/init.h>
 #include <linux/sysfs.h>
 #include <linux/kobject.h>
+#include <linux/module.h>
 
 #define DRIVER_NAME "vivo_cpu_info"
 
@@ -171,7 +172,7 @@ static void __exit vivo_cpu_info_exit(void)
     }
 }
 
-late_initcall(vivo_cpu_info_init);
+module_init(vivo_cpu_info_init);
 module_exit(vivo_cpu_info_exit);
 
 MODULE_LICENSE("GPL");
