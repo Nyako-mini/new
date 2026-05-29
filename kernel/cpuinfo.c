@@ -93,47 +93,66 @@ static struct kobj_attribute user_cpu_freq_attr = __ATTR(user_cpu_freq, 0444, us
 
 static int __init vivo_cpu_info_init(void)
 {
+    int ret = 0;
+    
     cpu_info_kobj = kobject_create_and_add("cpu_info", NULL);
-    if (!cpu_info_kobj)
-        return -ENOMEM;
+    if (!cpu_info_kobj) {
+        ret = -ENOMEM;
+        goto out;
+    }
 
     if (sysfs_create_file(cpu_info_kobj, &type_attr.attr))
-        pr_err("vivo_cpu_info: failed to create type file\n");
+        pr_warn("vivo_cpu_info: failed to create type file\n");
     if (sysfs_create_file(cpu_info_kobj, &cpu_freq_attr.attr))
-        pr_err("vivo_cpu_info: failed to create cpu_freq file\n");
+        pr_warn("vivo_cpu_info: failed to create cpu_freq file\n");
     if (sysfs_create_file(cpu_info_kobj, &core_num_attr.attr))
-        pr_err("vivo_cpu_info: failed to create core_num file\n");
+        pr_warn("vivo_cpu_info: failed to create core_num file\n");
     if (sysfs_create_file(cpu_info_kobj, &cpu_set_attr.attr))
-        pr_err("vivo_cpu_info: failed to create cpu_set file\n");
+        pr_warn("vivo_cpu_info: failed to create cpu_set file\n");
     if (sysfs_create_file(cpu_info_kobj, &user_cpu_freq_attr.attr))
-        pr_err("vivo_cpu_info: failed to create user_cpu_freq file\n");
+        pr_warn("vivo_cpu_info: failed to create user_cpu_freq file\n");
 
     devices_kobj = kobject_create_and_add("devices", NULL);
     if (!devices_kobj) {
-        kobject_put(cpu_info_kobj);
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto err_devices;
     }
 
     soc1_kobj = kobject_create_and_add("soc1", devices_kobj);
     if (!soc1_kobj) {
-        kobject_put(devices_kobj);
-        kobject_put(cpu_info_kobj);
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto err_soc1;
     }
 
     if (sysfs_create_file(soc1_kobj, &type_attr.attr))
-        pr_err("vivo_cpu_info: failed to create type file in soc1\n");
+        pr_warn("vivo_cpu_info: failed to create type file in soc1\n");
     if (sysfs_create_file(soc1_kobj, &cpu_freq_attr.attr))
-        pr_err("vivo_cpu_info: failed to create cpu_freq file in soc1\n");
+        pr_warn("vivo_cpu_info: failed to create cpu_freq file in soc1\n");
     if (sysfs_create_file(soc1_kobj, &core_num_attr.attr))
-        pr_err("vivo_cpu_info: failed to create core_num file in soc1\n");
+        pr_warn("vivo_cpu_info: failed to create core_num file in soc1\n");
     if (sysfs_create_file(soc1_kobj, &cpu_type_attr.attr))
-        pr_err("vivo_cpu_info: failed to create cpu_type file in soc1\n");
+        pr_warn("vivo_cpu_info: failed to create cpu_type file in soc1\n");
     if (sysfs_create_file(soc1_kobj, &user_cpu_freq_attr.attr))
-        pr_err("vivo_cpu_info: failed to create user_cpu_freq file in soc1\n");
+        pr_warn("vivo_cpu_info: failed to create user_cpu_freq file in soc1\n");
 
-    pr_info("vivo_cpu_info: initialized, /sys/cpu_info/ and /sys/devices/soc1/ created\n");
+    pr_info("vivo_cpu_info: initialized successfully\n");
     return 0;
+
+err_soc1:
+    kobject_put(devices_kobj);
+    devices_kobj = NULL;
+err_devices:
+    if (cpu_info_kobj) {
+        sysfs_remove_file(cpu_info_kobj, &user_cpu_freq_attr.attr);
+        sysfs_remove_file(cpu_info_kobj, &cpu_set_attr.attr);
+        sysfs_remove_file(cpu_info_kobj, &core_num_attr.attr);
+        sysfs_remove_file(cpu_info_kobj, &cpu_freq_attr.attr);
+        sysfs_remove_file(cpu_info_kobj, &type_attr.attr);
+        kobject_put(cpu_info_kobj);
+        cpu_info_kobj = NULL;
+    }
+out:
+    return ret;
 }
 
 static void __exit vivo_cpu_info_exit(void)
@@ -160,5 +179,5 @@ static void __exit vivo_cpu_info_exit(void)
     pr_info("vivo_cpu_info: exited\n");
 }
 
-early_initcall(vivo_cpu_info_init);
+late_initcall(vivo_cpu_info_init);
 module_exit(vivo_cpu_info_exit);
