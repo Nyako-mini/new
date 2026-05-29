@@ -1,14 +1,10 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
+#include <linux/module.h>
 #include <linux/sysfs.h>
 #include <linux/kobject.h>
-#include <linux/module.h>
 
 #define DRIVER_NAME "vivo_cpu_info"
-
-#define NEW_PATH "cpu_info"
-#define OLD_PATH "soc1"
-#define DEVICES_PATH "devices"
 
 struct cpu_config {
     int type;
@@ -36,9 +32,9 @@ static struct cpu_config normal = {
 
 static struct cpu_config *cur = &high_perf;
 
-static struct kobject *new_kobj = NULL;
-static struct kobject *old_kobj = NULL;
+static struct kobject *cpu_info_kobj = NULL;
 static struct kobject *devices_kobj = NULL;
+static struct kobject *soc1_kobj = NULL;
 
 static ssize_t type_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
@@ -95,106 +91,120 @@ static struct kobj_attribute cpu_set_attr = __ATTR(cpu_set, 0444, cpu_set_show, 
 static struct kobj_attribute cpu_type_attr = __ATTR(cpu_type, 0444, cpu_type_show, NULL);
 static struct kobj_attribute user_cpu_freq_attr = __ATTR(user_cpu_freq, 0444, user_cpu_freq_show, NULL);
 
-static struct attribute *new_attrs[] = {
-    &type_attr.attr,
-    &cpu_freq_attr.attr,
-    &core_num_attr.attr,
-    &cpu_set_attr.attr,
-    &user_cpu_freq_attr.attr,
-    NULL,
-};
-
-static const struct attribute_group new_group = {
-    .attrs = new_attrs,
-};
-
-static struct attribute *old_attrs[] = {
-    &type_attr.attr,
-    &cpu_freq_attr.attr,
-    &core_num_attr.attr,
-    &cpu_type_attr.attr,
-    &user_cpu_freq_attr.attr,
-    NULL,
-};
-
-static const struct attribute_group old_group = {
-    .attrs = old_attrs,
-};
-
 static int __init vivo_cpu_info_init(void)
 {
-    int ret = 0;
-    
-    new_kobj = kobject_create_and_add(NEW_PATH, NULL);
-    if (!new_kobj) {
-        printk(KERN_ERR "%s: failed to create %s\n", DRIVER_NAME, NEW_PATH);
+    int ret;
+
+    cpu_info_kobj = kobject_create_and_add("cpu_info", NULL);
+    if (!cpu_info_kobj) {
         return -ENOMEM;
     }
 
-    ret = sysfs_create_group(new_kobj, &new_group);
-    if (ret) {
-        printk(KERN_ERR "%s: failed to create group for %s\n", DRIVER_NAME, NEW_PATH);
-        kobject_put(new_kobj);
-        new_kobj = NULL;
-        return ret;
-    }
+    ret = sysfs_create_file(cpu_info_kobj, &type_attr.attr);
+    if (ret)
+        goto err_cpu_info_type;
 
-    devices_kobj = kobject_create_and_add(DEVICES_PATH, NULL);
+    ret = sysfs_create_file(cpu_info_kobj, &cpu_freq_attr.attr);
+    if (ret)
+        goto err_cpu_info_freq;
+
+    ret = sysfs_create_file(cpu_info_kobj, &core_num_attr.attr);
+    if (ret)
+        goto err_cpu_info_core;
+
+    ret = sysfs_create_file(cpu_info_kobj, &cpu_set_attr.attr);
+    if (ret)
+        goto err_cpu_info_set;
+
+    ret = sysfs_create_file(cpu_info_kobj, &user_cpu_freq_attr.attr);
+    if (ret)
+        goto err_cpu_info_user;
+
+    devices_kobj = kobject_create_and_add("devices", NULL);
     if (!devices_kobj) {
-        printk(KERN_ERR "%s: failed to create %s\n", DRIVER_NAME, DEVICES_PATH);
-        sysfs_remove_group(new_kobj, &new_group);
-        kobject_put(new_kobj);
-        new_kobj = NULL;
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto err_devices;
     }
 
-    old_kobj = kobject_create_and_add(OLD_PATH, devices_kobj);
-    if (!old_kobj) {
-        printk(KERN_ERR "%s: failed to create %s/%s\n", DRIVER_NAME, DEVICES_PATH, OLD_PATH);
-        kobject_put(devices_kobj);
-        devices_kobj = NULL;
-        sysfs_remove_group(new_kobj, &new_group);
-        kobject_put(new_kobj);
-        new_kobj = NULL;
-        return -ENOMEM;
+    soc1_kobj = kobject_create_and_add("soc1", devices_kobj);
+    if (!soc1_kobj) {
+        ret = -ENOMEM;
+        goto err_soc1;
     }
 
-    ret = sysfs_create_group(old_kobj, &old_group);
-    if (ret) {
-        printk(KERN_ERR "%s: failed to create group for %s/%s\n", DRIVER_NAME, DEVICES_PATH, OLD_PATH);
-        kobject_put(old_kobj);
-        old_kobj = NULL;
-        kobject_put(devices_kobj);
-        devices_kobj = NULL;
-        sysfs_remove_group(new_kobj, &new_group);
-        kobject_put(new_kobj);
-        new_kobj = NULL;
-        return ret;
-    }
+    ret = sysfs_create_file(soc1_kobj, &type_attr.attr);
+    if (ret)
+        goto err_soc1_type;
 
-    printk(KERN_INFO "%s: initialized successfully\n", DRIVER_NAME);
-    printk(KERN_INFO "%s: /sys/%s/ and /sys/%s/%s/ created\n", DRIVER_NAME, NEW_PATH, DEVICES_PATH, OLD_PATH);
-    
+    ret = sysfs_create_file(soc1_kobj, &cpu_freq_attr.attr);
+    if (ret)
+        goto err_soc1_freq;
+
+    ret = sysfs_create_file(soc1_kobj, &core_num_attr.attr);
+    if (ret)
+        goto err_soc1_core;
+
+    ret = sysfs_create_file(soc1_kobj, &cpu_type_attr.attr);
+    if (ret)
+        goto err_soc1_cpu_type;
+
+    ret = sysfs_create_file(soc1_kobj, &user_cpu_freq_attr.attr);
+    if (ret)
+        goto err_soc1_user;
+
     return 0;
+
+err_soc1_user:
+    sysfs_remove_file(soc1_kobj, &cpu_type_attr.attr);
+err_soc1_cpu_type:
+    sysfs_remove_file(soc1_kobj, &core_num_attr.attr);
+err_soc1_core:
+    sysfs_remove_file(soc1_kobj, &cpu_freq_attr.attr);
+err_soc1_freq:
+    sysfs_remove_file(soc1_kobj, &type_attr.attr);
+err_soc1_type:
+    kobject_put(soc1_kobj);
+    soc1_kobj = NULL;
+err_soc1:
+    kobject_put(devices_kobj);
+    devices_kobj = NULL;
+err_devices:
+    sysfs_remove_file(cpu_info_kobj, &user_cpu_freq_attr.attr);
+err_cpu_info_user:
+    sysfs_remove_file(cpu_info_kobj, &cpu_set_attr.attr);
+err_cpu_info_set:
+    sysfs_remove_file(cpu_info_kobj, &core_num_attr.attr);
+err_cpu_info_core:
+    sysfs_remove_file(cpu_info_kobj, &cpu_freq_attr.attr);
+err_cpu_info_freq:
+    sysfs_remove_file(cpu_info_kobj, &type_attr.attr);
+err_cpu_info_type:
+    kobject_put(cpu_info_kobj);
+    cpu_info_kobj = NULL;
+    return ret;
 }
 
 static void __exit vivo_cpu_info_exit(void)
 {
-    if (old_kobj) {
-        sysfs_remove_group(old_kobj, &old_group);
-        kobject_put(old_kobj);
-        old_kobj = NULL;
+    if (soc1_kobj) {
+        sysfs_remove_file(soc1_kobj, &user_cpu_freq_attr.attr);
+        sysfs_remove_file(soc1_kobj, &cpu_type_attr.attr);
+        sysfs_remove_file(soc1_kobj, &core_num_attr.attr);
+        sysfs_remove_file(soc1_kobj, &cpu_freq_attr.attr);
+        sysfs_remove_file(soc1_kobj, &type_attr.attr);
+        kobject_put(soc1_kobj);
     }
     if (devices_kobj) {
         kobject_put(devices_kobj);
-        devices_kobj = NULL;
     }
-    if (new_kobj) {
-        sysfs_remove_group(new_kobj, &new_group);
-        kobject_put(new_kobj);
-        new_kobj = NULL;
+    if (cpu_info_kobj) {
+        sysfs_remove_file(cpu_info_kobj, &user_cpu_freq_attr.attr);
+        sysfs_remove_file(cpu_info_kobj, &cpu_set_attr.attr);
+        sysfs_remove_file(cpu_info_kobj, &core_num_attr.attr);
+        sysfs_remove_file(cpu_info_kobj, &cpu_freq_attr.attr);
+        sysfs_remove_file(cpu_info_kobj, &type_attr.attr);
+        kobject_put(cpu_info_kobj);
     }
-    printk(KERN_INFO "%s: exited\n", DRIVER_NAME);
 }
 
 pure_initcall(vivo_cpu_info_init);
