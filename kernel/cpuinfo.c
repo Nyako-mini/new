@@ -1,7 +1,6 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/sysfs.h>
-#include <linux/module.h>
 #include <linux/kobject.h>
 
 #define DRIVER_NAME "vivo_cpu_info"
@@ -38,7 +37,7 @@ static struct cpu_config *cur = &high_perf;
 
 static struct kobject *new_kobj = NULL;
 static struct kobject *old_kobj = NULL;
-static struct kobject *dev_kobj = NULL;
+static struct kobject *devices_kobj = NULL;
 
 static ssize_t type_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
@@ -55,10 +54,8 @@ static ssize_t type_store(struct kobject *kobj, struct kobj_attribute *attr,
     
     if (val == 1) {
         cur = &high_perf;
-        pr_info("%s: high performance mode (2.96GHz)\n", DRIVER_NAME);
     } else if (val == 0) {
         cur = &normal;
-        pr_info("%s: normal mode (2.84GHz)\n", DRIVER_NAME);
     } else {
         return -EINVAL;
     }
@@ -125,50 +122,39 @@ static const struct attribute_group old_group = {
 
 static int __init vivo_cpu_info_init(void)
 {
-    int ret;
-
     new_kobj = kobject_create_and_add(NEW_PATH, NULL);
-    if (!new_kobj) {
-        ret = -ENOMEM;
-        goto err;
+    if (!new_kobj)
+        return -ENOMEM;
+
+    if (sysfs_create_group(new_kobj, &new_group)) {
+        kobject_put(new_kobj);
+        return -ENOMEM;
     }
 
-    ret = sysfs_create_group(new_kobj, &new_group);
-    if (ret)
-        goto err_new;
-
-    dev_kobj = kobject_create_and_add(DEVICES_PATH, NULL);
-    if (!dev_kobj) {
-        ret = -ENOMEM;
-        goto err_new_group;
+    devices_kobj = kobject_create_and_add(DEVICES_PATH, NULL);
+    if (!devices_kobj) {
+        sysfs_remove_group(new_kobj, &new_group);
+        kobject_put(new_kobj);
+        return -ENOMEM;
     }
 
-    old_kobj = kobject_create_and_add(OLD_PATH, dev_kobj);
+    old_kobj = kobject_create_and_add(OLD_PATH, devices_kobj);
     if (!old_kobj) {
-        ret = -ENOMEM;
-        goto err_dev;
+        kobject_put(devices_kobj);
+        sysfs_remove_group(new_kobj, &new_group);
+        kobject_put(new_kobj);
+        return -ENOMEM;
     }
 
-    ret = sysfs_create_group(old_kobj, &old_group);
-    if (ret)
-        goto err_old;
+    if (sysfs_create_group(old_kobj, &old_group)) {
+        kobject_put(old_kobj);
+        kobject_put(devices_kobj);
+        sysfs_remove_group(new_kobj, &new_group);
+        kobject_put(new_kobj);
+        return -ENOMEM;
+    }
 
-    pr_info("%s: initialized (type=%d, %s)\n", DRIVER_NAME, cur->type, cur->user_freq);
     return 0;
-
-err_old:
-    kobject_put(old_kobj);
-    old_kobj = NULL;
-err_dev:
-    kobject_put(dev_kobj);
-    dev_kobj = NULL;
-err_new_group:
-    sysfs_remove_group(new_kobj, &new_group);
-err_new:
-    kobject_put(new_kobj);
-    new_kobj = NULL;
-err:
-    return ret;
 }
 
 static void __exit vivo_cpu_info_exit(void)
@@ -177,18 +163,15 @@ static void __exit vivo_cpu_info_exit(void)
         sysfs_remove_group(old_kobj, &old_group);
         kobject_put(old_kobj);
     }
-    if (dev_kobj)
-        kobject_put(dev_kobj);
+    if (devices_kobj)
+        kobject_put(devices_kobj);
     if (new_kobj) {
         sysfs_remove_group(new_kobj, &new_group);
         kobject_put(new_kobj);
     }
-    pr_info("%s: removed\n", DRIVER_NAME);
 }
 
 late_initcall(vivo_cpu_info_init);
 module_exit(vivo_cpu_info_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Vivo");
-MODULE_DESCRIPTION("Vivo CPU Info Driver");
