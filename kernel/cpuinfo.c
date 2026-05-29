@@ -17,15 +17,15 @@ struct cpu_config {
 
 static struct cpu_config high_perf = {
     .type = 1,
-    .user_freq = "2.96GHz",
-    .model = "855",
+    .user_freq = "2.96",
+    .model = "855 +",
     .cores = 8,
     .freq_khz = 2960000,
 };
 
 static struct cpu_config normal = {
     .type = 0,
-    .user_freq = "2.84GHz",
+    .user_freq = "2.84",
     .model = "855",
     .cores = 8,
     .freq_khz = 2840000,
