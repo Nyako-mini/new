@@ -4,7 +4,6 @@
 #include <linux/sysfs.h>
 #include <linux/kobject.h>
 #include <linux/fs.h>
-#include <linux/device.h>
 
 #define DRIVER_NAME "vivo_cpu_info"
 
@@ -34,16 +33,16 @@ static struct cpu_config normal = {
 
 static struct cpu_config *cur = &high_perf;
 
-static struct class *cpu_class = NULL;
-static struct device *cpu_device = NULL;
-static struct device *soc1_device = NULL;
+static struct kobject *cpu_info_kobj;
+static struct kobject *devices_kobj;
+static struct kobject *soc1_kobj;
 
-static ssize_t type_show(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t type_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-    return scnprintf(buf, PAGE_SIZE, "%d\n", cur->type);
+    return sprintf(buf, "%d\n", cur->type);
 }
 
-static ssize_t type_store(struct device *dev, struct device_attribute *attr,
+static ssize_t type_store(struct kobject *kobj, struct kobj_attribute *attr,
                           const char *buf, size_t count)
 {
     int ret, val;
@@ -61,166 +60,152 @@ static ssize_t type_store(struct device *dev, struct device_attribute *attr,
     return count;
 }
 
-static ssize_t cpu_freq_show(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t cpu_freq_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-    return scnprintf(buf, PAGE_SIZE, "%d\n", cur->freq_khz);
+    return sprintf(buf, "%d\n", cur->freq_khz);
 }
 
-static ssize_t core_num_show(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t core_num_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-    return scnprintf(buf, PAGE_SIZE, "%d\n", cur->cores);
+    return sprintf(buf, "%d\n", cur->cores);
 }
 
-static ssize_t cpu_set_show(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t cpu_set_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-    return scnprintf(buf, PAGE_SIZE, "%s\n", cur->model);
+    return sprintf(buf, "%s\n", cur->model);
 }
 
-static ssize_t cpu_type_show(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t cpu_type_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-    return scnprintf(buf, PAGE_SIZE, "%s\n", cur->model);
+    return sprintf(buf, "%s\n", cur->model);
 }
 
-static ssize_t user_cpu_freq_show(struct device *dev, struct device_attribute *attr, char *buf)
+static ssize_t user_cpu_freq_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
-    return scnprintf(buf, PAGE_SIZE, "%s\n", cur->user_freq);
+    return sprintf(buf, "%s\n", cur->user_freq);
 }
 
-static DEVICE_ATTR(type, 0644, type_show, type_store);
-static DEVICE_ATTR(cpu_freq, 0444, cpu_freq_show, NULL);
-static DEVICE_ATTR(core_num, 0444, core_num_show, NULL);
-static DEVICE_ATTR(cpu_set, 0444, cpu_set_show, NULL);
-static DEVICE_ATTR(cpu_type, 0444, cpu_type_show, NULL);
-static DEVICE_ATTR(user_cpu_freq, 0444, user_cpu_freq_show, NULL);
+static struct kobj_attribute type_attribute = __ATTR(type, 0644, type_show, type_store);
+static struct kobj_attribute cpu_freq_attribute = __ATTR(cpu_freq, 0444, cpu_freq_show, NULL);
+static struct kobj_attribute core_num_attribute = __ATTR(core_num, 0444, core_num_show, NULL);
+static struct kobj_attribute cpu_set_attribute = __ATTR(cpu_set, 0444, cpu_set_show, NULL);
+static struct kobj_attribute cpu_type_attribute = __ATTR(cpu_type, 0444, cpu_type_show, NULL);
+static struct kobj_attribute user_cpu_freq_attribute = __ATTR(user_cpu_freq, 0444, user_cpu_freq_show, NULL);
 
 static int __init vivo_cpu_info_init(void)
 {
-    int ret;
+    printk(KERN_INFO "%s: init started\n", DRIVER_NAME);
 
-    cpu_class = class_create(THIS_MODULE, "cpu_info");
-    if (IS_ERR(cpu_class)) {
-        return PTR_ERR(cpu_class);
+    cpu_info_kobj = kobject_create_and_add("cpu_info", NULL);
+    if (!cpu_info_kobj) {
+        printk(KERN_ERR "%s: failed to create cpu_info kobject\n", DRIVER_NAME);
+        return -ENOMEM;
+    }
+    printk(KERN_INFO "%s: created cpu_info kobject at %p\n", DRIVER_NAME, cpu_info_kobj);
+
+    if (sysfs_create_file(cpu_info_kobj, &type_attribute.attr)) {
+        printk(KERN_ERR "%s: failed to create type file\n", DRIVER_NAME);
+        goto err_cpu_info;
+    }
+    if (sysfs_create_file(cpu_info_kobj, &cpu_freq_attribute.attr)) {
+        printk(KERN_ERR "%s: failed to create cpu_freq file\n", DRIVER_NAME);
+        goto err_cpu_info;
+    }
+    if (sysfs_create_file(cpu_info_kobj, &core_num_attribute.attr)) {
+        printk(KERN_ERR "%s: failed to create core_num file\n", DRIVER_NAME);
+        goto err_cpu_info;
+    }
+    if (sysfs_create_file(cpu_info_kobj, &cpu_set_attribute.attr)) {
+        printk(KERN_ERR "%s: failed to create cpu_set file\n", DRIVER_NAME);
+        goto err_cpu_info;
+    }
+    if (sysfs_create_file(cpu_info_kobj, &user_cpu_freq_attribute.attr)) {
+        printk(KERN_ERR "%s: failed to create user_cpu_freq file\n", DRIVER_NAME);
+        goto err_cpu_info;
     }
 
-    cpu_device = device_create(cpu_class, NULL, MKDEV(0, 0), NULL, "info");
-    if (IS_ERR(cpu_device)) {
-        ret = PTR_ERR(cpu_device);
-        goto err_cpu_device;
+    devices_kobj = kobject_create_and_add("devices", NULL);
+    if (!devices_kobj) {
+        printk(KERN_ERR "%s: failed to create devices kobject\n", DRIVER_NAME);
+        goto err_cpu_info;
+    }
+    printk(KERN_INFO "%s: created devices kobject at %p\n", DRIVER_NAME, devices_kobj);
+
+    soc1_kobj = kobject_create_and_add("soc1", devices_kobj);
+    if (!soc1_kobj) {
+        printk(KERN_ERR "%s: failed to create soc1 kobject\n", DRIVER_NAME);
+        goto err_devices;
+    }
+    printk(KERN_INFO "%s: created soc1 kobject at %p\n", DRIVER_NAME, soc1_kobj);
+
+    if (sysfs_create_file(soc1_kobj, &type_attribute.attr)) {
+        printk(KERN_ERR "%s: failed to create type file in soc1\n", DRIVER_NAME);
+        goto err_soc1;
+    }
+    if (sysfs_create_file(soc1_kobj, &cpu_freq_attribute.attr)) {
+        printk(KERN_ERR "%s: failed to create cpu_freq file in soc1\n", DRIVER_NAME);
+        goto err_soc1;
+    }
+    if (sysfs_create_file(soc1_kobj, &core_num_attribute.attr)) {
+        printk(KERN_ERR "%s: failed to create core_num file in soc1\n", DRIVER_NAME);
+        goto err_soc1;
+    }
+    if (sysfs_create_file(soc1_kobj, &cpu_type_attribute.attr)) {
+        printk(KERN_ERR "%s: failed to create cpu_type file in soc1\n", DRIVER_NAME);
+        goto err_soc1;
+    }
+    if (sysfs_create_file(soc1_kobj, &user_cpu_freq_attribute.attr)) {
+        printk(KERN_ERR "%s: failed to create user_cpu_freq file in soc1\n", DRIVER_NAME);
+        goto err_soc1;
     }
 
-    ret = device_create_file(cpu_device, &dev_attr_type);
-    if (ret)
-        goto err_type;
-
-    ret = device_create_file(cpu_device, &dev_attr_cpu_freq);
-    if (ret)
-        goto err_freq;
-
-    ret = device_create_file(cpu_device, &dev_attr_core_num);
-    if (ret)
-        goto err_core;
-
-    ret = device_create_file(cpu_device, &dev_attr_cpu_set);
-    if (ret)
-        goto err_set;
-
-    ret = device_create_file(cpu_device, &dev_attr_user_cpu_freq);
-    if (ret)
-        goto err_user;
-
-    ret = device_create_file(cpu_device, &dev_attr_cpu_type);
-    if (ret)
-        goto err_cpu_type;
-
-    device_remove_file(cpu_device, &dev_attr_cpu_type);
-    device_remove_file(cpu_device, &dev_attr_user_cpu_freq);
-    device_remove_file(cpu_device, &dev_attr_cpu_set);
-    device_remove_file(cpu_device, &dev_attr_core_num);
-    device_remove_file(cpu_device, &dev_attr_cpu_freq);
-    device_remove_file(cpu_device, &dev_attr_type);
-    device_destroy(cpu_class, MKDEV(0, 0));
-    class_destroy(cpu_class);
-    
-    cpu_class = class_create(THIS_MODULE, "devices");
-    if (IS_ERR(cpu_class)) {
-        return PTR_ERR(cpu_class);
-    }
-
-    soc1_device = device_create(cpu_class, NULL, MKDEV(0, 0), NULL, "soc1");
-    if (IS_ERR(soc1_device)) {
-        ret = PTR_ERR(soc1_device);
-        goto err_soc1_device;
-    }
-
-    ret = device_create_file(soc1_device, &dev_attr_type);
-    if (ret)
-        goto err_soc1_type;
-
-    ret = device_create_file(soc1_device, &dev_attr_cpu_freq);
-    if (ret)
-        goto err_soc1_freq;
-
-    ret = device_create_file(soc1_device, &dev_attr_core_num);
-    if (ret)
-        goto err_soc1_core;
-
-    ret = device_create_file(soc1_device, &dev_attr_cpu_type);
-    if (ret)
-        goto err_soc1_cpu_type;
-
-    ret = device_create_file(soc1_device, &dev_attr_user_cpu_freq);
-    if (ret)
-        goto err_soc1_user;
-
+    printk(KERN_INFO "%s: init completed successfully\n", DRIVER_NAME);
     return 0;
 
-err_soc1_user:
-    device_remove_file(soc1_device, &dev_attr_cpu_type);
-err_soc1_cpu_type:
-    device_remove_file(soc1_device, &dev_attr_core_num);
-err_soc1_core:
-    device_remove_file(soc1_device, &dev_attr_cpu_freq);
-err_soc1_freq:
-    device_remove_file(soc1_device, &dev_attr_type);
-err_soc1_type:
-    device_destroy(cpu_class, MKDEV(0, 0));
-err_soc1_device:
-    class_destroy(cpu_class);
-    return ret;
-
-err_cpu_type:
-    device_remove_file(cpu_device, &dev_attr_user_cpu_freq);
-err_user:
-    device_remove_file(cpu_device, &dev_attr_cpu_set);
-err_set:
-    device_remove_file(cpu_device, &dev_attr_core_num);
-err_core:
-    device_remove_file(cpu_device, &dev_attr_cpu_freq);
-err_freq:
-    device_remove_file(cpu_device, &dev_attr_type);
-err_type:
-    device_destroy(cpu_class, MKDEV(0, 0));
-err_cpu_device:
-    class_destroy(cpu_class);
-    return ret;
+err_soc1:
+    kobject_put(soc1_kobj);
+    soc1_kobj = NULL;
+err_devices:
+    kobject_put(devices_kobj);
+    devices_kobj = NULL;
+err_cpu_info:
+    if (cpu_info_kobj) {
+        sysfs_remove_file(cpu_info_kobj, &user_cpu_freq_attribute.attr);
+        sysfs_remove_file(cpu_info_kobj, &cpu_set_attribute.attr);
+        sysfs_remove_file(cpu_info_kobj, &core_num_attribute.attr);
+        sysfs_remove_file(cpu_info_kobj, &cpu_freq_attribute.attr);
+        sysfs_remove_file(cpu_info_kobj, &type_attribute.attr);
+        kobject_put(cpu_info_kobj);
+        cpu_info_kobj = NULL;
+    }
+    return -ENOMEM;
 }
 
 static void __exit vivo_cpu_info_exit(void)
 {
-    if (soc1_device) {
-        device_remove_file(soc1_device, &dev_attr_user_cpu_freq);
-        device_remove_file(soc1_device, &dev_attr_cpu_type);
-        device_remove_file(soc1_device, &dev_attr_core_num);
-        device_remove_file(soc1_device, &dev_attr_cpu_freq);
-        device_remove_file(soc1_device, &dev_attr_type);
-        device_destroy(cpu_class, MKDEV(0, 0));
+    if (soc1_kobj) {
+        sysfs_remove_file(soc1_kobj, &user_cpu_freq_attribute.attr);
+        sysfs_remove_file(soc1_kobj, &cpu_type_attribute.attr);
+        sysfs_remove_file(soc1_kobj, &core_num_attribute.attr);
+        sysfs_remove_file(soc1_kobj, &cpu_freq_attribute.attr);
+        sysfs_remove_file(soc1_kobj, &type_attribute.attr);
+        kobject_put(soc1_kobj);
     }
-    if (cpu_class) {
-        class_destroy(cpu_class);
+    if (devices_kobj) {
+        kobject_put(devices_kobj);
     }
+    if (cpu_info_kobj) {
+        sysfs_remove_file(cpu_info_kobj, &user_cpu_freq_attribute.attr);
+        sysfs_remove_file(cpu_info_kobj, &cpu_set_attribute.attr);
+        sysfs_remove_file(cpu_info_kobj, &core_num_attribute.attr);
+        sysfs_remove_file(cpu_info_kobj, &cpu_freq_attribute.attr);
+        sysfs_remove_file(cpu_info_kobj, &type_attribute.attr);
+        kobject_put(cpu_info_kobj);
+    }
+    printk(KERN_INFO "%s: exit completed\n", DRIVER_NAME);
 }
 
-late_initcall(vivo_cpu_info_init);
+subsys_initcall(vivo_cpu_info_init);
 module_exit(vivo_cpu_info_exit);
 
 MODULE_LICENSE("GPL");
