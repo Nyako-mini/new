@@ -111,12 +111,18 @@ static int __init vivo_cpu_info_init(void)
     if (sysfs_create_file(cpu_info_kobj, &user_cpu_freq_attr.attr))
         pr_err("vivo_cpu_info: failed to create user_cpu_freq\n");
 
-    devices_kobj = kobject_get(kernel_kobj);
+    pr_info("vivo_cpu_info: created /sys/cpu_info/\n");
+
+    devices_kobj = kobject_create_and_add("devices", NULL);
     if (!devices_kobj) {
-        pr_err("vivo_cpu_info: failed to get kernel_kobj\n");
-        goto err_cpu_info;
+        pr_warn("vivo_cpu_info: /sys/devices already exists, trying to find it\n");
+        devices_kobj = kobject_get(kernel_kobj);
+        if (!devices_kobj) {
+            pr_err("vivo_cpu_info: failed to get kernel kobject\n");
+            goto err_cpu_info;
+        }
     }
-    
+
     soc1_kobj = kobject_create_and_add("soc1", devices_kobj);
     kobject_put(devices_kobj);
     
