@@ -21,7 +21,6 @@
 #include <linux/mm_inline.h>
 #include <linux/ctype.h>
 #include <linux/mm_inline.h>
-#include <linux/susfs_def.h>
 #include <asm/elf.h>
 #include <asm/tlb.h>
 #include <asm/tlbflush.h>
