@@ -7,8 +7,8 @@
 #include <linux/file.h>
 #include <linux/uaccess.h>
 
-#define SRC_SOH "/sys/class/qcom-battery/soh"
-#define SRC_CYCLE "/sys/class/power_supply/battery/cycle_count"
+#define SRC_SOH "/sys/class/power_supply/bms/soh"
+#define SRC_CYCLE "/sys/class/power_supply/bms/cycle_count"
 
 static struct class *fuel_class;
 
