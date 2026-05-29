@@ -13,6 +13,38 @@
 static struct class *fuel_class;
 static struct device *fuel_device;
 
+static ssize_t read_source_file(const char *path, char *buf, size_t count)
+{
+    struct file *file;
+    ssize_t ret;
+    loff_t pos = 0;
+    char *tmp_buf;
+    mm_segment_t old_fs;
+
+    file = filp_open(path, O_RDONLY, 0);
+    if (IS_ERR(file))
+        return PTR_ERR(file);
+
+    tmp_buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+    if (!tmp_buf) {
+        filp_close(file, NULL);
+        return -ENOMEM;
+    }
+
+    old_fs = get_fs();
+    set_fs(KERNEL_DS);
+    ret = file->f_op->read(file, tmp_buf, PAGE_SIZE - 1, &pos);
+    set_fs(old_fs);
+
+    if (ret >= 0) {
+        tmp_buf[ret] = '\0';
+        snprintf(buf, count, "%s", tmp_buf);
+    }
+
+    kfree(tmp_buf);
+    filp_close(file, NULL);
+    return ret;
+}
 
 static ssize_t soh_show(struct class *cls, struct class_attribute *attr, char *buf)
 {
@@ -36,26 +68,18 @@ ATTRIBUTE_GROUPS(fuel);
 
 static int __init fuelsummary_init(void)
 {
-    int ret;
-
     fuel_class = class_create(THIS_MODULE, "fuelsummary");
     if (IS_ERR(fuel_class))
         return PTR_ERR(fuel_class);
 
-    fuel_device = device_create(fuel_class, NULL, MKDEV(0, 0), NULL, "summary");
+    fuel_device = device_create(fuel_class, NULL, MKDEV(0, 0), NULL, "battery");
     if (IS_ERR(fuel_device)) {
-        ret = PTR_ERR(fuel_device);
-        goto err_device;
+        class_destroy(fuel_class);
+        return PTR_ERR(fuel_device);
     }
 
     fuel_class->dev_groups = fuel_groups;
-    
-    pr_info("fuelsummary: initialized\n");
     return 0;
-
-err_device:
-    class_destroy(fuel_class);
-    return ret;
 }
 
 static void __exit fuelsummary_exit(void)
@@ -64,7 +88,6 @@ static void __exit fuelsummary_exit(void)
         device_destroy(fuel_class, MKDEV(0, 0));
     if (fuel_class)
         class_destroy(fuel_class);
-    pr_info("fuelsummary: exited\n");
 }
 
 module_init(fuelsummary_init);
