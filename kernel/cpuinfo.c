@@ -123,38 +123,58 @@ static const struct attribute_group old_group = {
 
 static int __init vivo_cpu_info_init(void)
 {
+    int ret = 0;
+    
     new_kobj = kobject_create_and_add(NEW_PATH, NULL);
-    if (!new_kobj)
+    if (!new_kobj) {
+        printk(KERN_ERR "%s: failed to create %s\n", DRIVER_NAME, NEW_PATH);
         return -ENOMEM;
+    }
 
-    if (sysfs_create_group(new_kobj, &new_group)) {
+    ret = sysfs_create_group(new_kobj, &new_group);
+    if (ret) {
+        printk(KERN_ERR "%s: failed to create group for %s\n", DRIVER_NAME, NEW_PATH);
         kobject_put(new_kobj);
-        return -ENOMEM;
+        new_kobj = NULL;
+        return ret;
     }
 
     devices_kobj = kobject_create_and_add(DEVICES_PATH, NULL);
     if (!devices_kobj) {
+        printk(KERN_ERR "%s: failed to create %s\n", DRIVER_NAME, DEVICES_PATH);
         sysfs_remove_group(new_kobj, &new_group);
         kobject_put(new_kobj);
+        new_kobj = NULL;
         return -ENOMEM;
     }
 
     old_kobj = kobject_create_and_add(OLD_PATH, devices_kobj);
     if (!old_kobj) {
+        printk(KERN_ERR "%s: failed to create %s/%s\n", DRIVER_NAME, DEVICES_PATH, OLD_PATH);
         kobject_put(devices_kobj);
+        devices_kobj = NULL;
         sysfs_remove_group(new_kobj, &new_group);
         kobject_put(new_kobj);
+        new_kobj = NULL;
         return -ENOMEM;
     }
 
-    if (sysfs_create_group(old_kobj, &old_group)) {
+    ret = sysfs_create_group(old_kobj, &old_group);
+    if (ret) {
+        printk(KERN_ERR "%s: failed to create group for %s/%s\n", DRIVER_NAME, DEVICES_PATH, OLD_PATH);
         kobject_put(old_kobj);
+        old_kobj = NULL;
         kobject_put(devices_kobj);
+        devices_kobj = NULL;
         sysfs_remove_group(new_kobj, &new_group);
         kobject_put(new_kobj);
-        return -ENOMEM;
+        new_kobj = NULL;
+        return ret;
     }
 
+    printk(KERN_INFO "%s: initialized successfully\n", DRIVER_NAME);
+    printk(KERN_INFO "%s: /sys/%s/ and /sys/%s/%s/ created\n", DRIVER_NAME, NEW_PATH, DEVICES_PATH, OLD_PATH);
+    
     return 0;
 }
 
@@ -163,16 +183,21 @@ static void __exit vivo_cpu_info_exit(void)
     if (old_kobj) {
         sysfs_remove_group(old_kobj, &old_group);
         kobject_put(old_kobj);
+        old_kobj = NULL;
     }
-    if (devices_kobj)
+    if (devices_kobj) {
         kobject_put(devices_kobj);
+        devices_kobj = NULL;
+    }
     if (new_kobj) {
         sysfs_remove_group(new_kobj, &new_group);
         kobject_put(new_kobj);
+        new_kobj = NULL;
     }
+    printk(KERN_INFO "%s: exited\n", DRIVER_NAME);
 }
 
-module_init(vivo_cpu_info_init);
+pure_initcall(vivo_cpu_info_init);
 module_exit(vivo_cpu_info_exit);
 
 MODULE_LICENSE("GPL");
