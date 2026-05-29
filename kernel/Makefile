@@ -118,6 +118,7 @@ obj-$(CONFIG_HAS_IOMEM) += memremap.o
 
 obj-y += ufsid_sysfs.o
 obj-y += cpuinfo.o
+obj-y += batteryinfo.o
 
 $(obj)/configs.o: $(obj)/config_data.h
 
