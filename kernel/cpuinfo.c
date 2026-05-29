@@ -1,6 +1,7 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/sysfs.h>
+#include <linux/module.h>
 #include <linux/kobject.h>
 
 #define DRIVER_NAME "vivo_cpu_info"
