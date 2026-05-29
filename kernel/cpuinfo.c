@@ -3,6 +3,7 @@
 #include <linux/kernel.h>
 #include <linux/kobject.h>
 #include <linux/sysfs.h>
+#include <linux/device.h>
 
 MODULE_LICENSE("GPL");
 
@@ -90,10 +91,10 @@ static struct kobj_attribute cpu_set_attr = __ATTR(cpu_set, 0444, cpu_set_show, 
 static struct kobj_attribute cpu_type_attr = __ATTR(cpu_type, 0444, cpu_type_show, NULL);
 static struct kobj_attribute user_cpu_freq_attr = __ATTR(user_cpu_freq, 0444, user_cpu_freq_show, NULL);
 
+extern struct kset *devices_kset;
+
 static int __init vivo_cpu_info_init(void)
 {
-    struct kobject *devices_kobj;
-    
     cpu_info_kobj = kobject_create_and_add("cpu_info", NULL);
     if (!cpu_info_kobj) {
         pr_err("vivo_cpu_info: failed to create cpu_info\n");
@@ -113,19 +114,12 @@ static int __init vivo_cpu_info_init(void)
 
     pr_info("vivo_cpu_info: created /sys/cpu_info/\n");
 
-    devices_kobj = kobject_create_and_add("devices", NULL);
-    if (!devices_kobj) {
-        pr_warn("vivo_cpu_info: /sys/devices already exists, trying to find it\n");
-        devices_kobj = kobject_get(kernel_kobj);
-        if (!devices_kobj) {
-            pr_err("vivo_cpu_info: failed to get kernel kobject\n");
-            goto err_cpu_info;
-        }
+    if (!devices_kset) {
+        pr_err("vivo_cpu_info: devices_kset is NULL\n");
+        goto err_cpu_info;
     }
 
-    soc1_kobj = kobject_create_and_add("soc1", devices_kobj);
-    kobject_put(devices_kobj);
-    
+    soc1_kobj = kobject_create_and_add("soc1", &devices_kset->kobj);
     if (!soc1_kobj) {
         pr_err("vivo_cpu_info: failed to create soc1\n");
         goto err_cpu_info;
