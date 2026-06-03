@@ -6,11 +6,47 @@
 #include <linux/slab.h>
 #include <linux/file.h>
 #include <linux/uaccess.h>
+#include <linux/math64.h>
 
-#define SRC_SOH "/sys/class/power_supply/bms/soh"
-#define SRC_CYCLE "/sys/class/power_supply/bms/cycle_count"
+#define SRC_CHARGE_FULL     "/sys/class/power_supply/bms/charge_full"
+#define SRC_CHARGE_FULL_DESIGN "/sys/class/power_supply/bms/charge_full_design"
+#define SRC_CYCLE           "/sys/class/power_supply/bms/cycle_count"
 
 static struct class *fuel_class;
+
+static int read_int_from_file(const char *path, int *value)
+{
+    struct file *file;
+    ssize_t ret;
+    loff_t pos = 0;
+    char *tmp_buf;
+    mm_segment_t old_fs;
+    int result = -EINVAL;
+
+    file = filp_open(path, O_RDONLY, 0);
+    if (IS_ERR(file))
+        return PTR_ERR(file);
+
+    tmp_buf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+    if (!tmp_buf) {
+        filp_close(file, NULL);
+        return -ENOMEM;
+    }
+
+    old_fs = get_fs();
+    set_fs(KERNEL_DS);
+    ret = file->f_op->read(file, tmp_buf, PAGE_SIZE - 1, &pos);
+    set_fs(old_fs);
+
+    if (ret > 0) {
+        tmp_buf[ret] = '\0';
+        result = kstrtoint(tmp_buf, 10, value);
+    }
+
+    kfree(tmp_buf);
+    filp_close(file, NULL);
+    return result == 0 ? 0 : -EIO;
+}
 
 static ssize_t read_source_file(const char *path, char *buf, size_t count)
 {
@@ -47,7 +83,24 @@ static ssize_t read_source_file(const char *path, char *buf, size_t count)
 
 static ssize_t soh_show(struct class *cls, struct class_attribute *attr, char *buf)
 {
-    return read_source_file(SRC_SOH, buf, PAGE_SIZE);
+    int charge_full, charge_full_design;
+    int ret;
+    int soh_value;
+
+    ret = read_int_from_file(SRC_CHARGE_FULL, &charge_full);
+    if (ret < 0)
+        return ret;
+
+    ret = read_int_from_file(SRC_CHARGE_FULL_DESIGN, &charge_full_design);
+    if (ret < 0)
+        return ret;
+
+    if (charge_full_design == 0)
+        return -EINVAL;
+
+    soh_value = (int)div64_s64((s64)charge_full * 100, charge_full_design);
+
+    return snprintf(buf, PAGE_SIZE, "%d\n", soh_value);
 }
 
 static ssize_t cycle_show(struct class *cls, struct class_attribute *attr, char *buf)
